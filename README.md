@@ -18,13 +18,21 @@ Loading/QC data of Small Intestinal NETs.
 **01_loading_and_normalizingPanNET.html** *Final run of markdownfile as HTML output, download to open in browser*  
 Loading/QC data of Pancreatic NETs.  
 
+**01_loading_and_normalizingPulmNET.rmd** *R markdownfile*  
+**01_loading_and_normalizingPulmNET.html** *Final run of markdownfile as HTML output, download to open in browser*  
+Loading/QC data of Pulmonary NETs.  
+
 **01_loading_and_normalizingPanNET_caseseries.rmd** *R markdownfile*  
 **01_loading_and_normalizingPanNET_caseseries.html** *Final run of markdownfile as HTML output, download to open in browser*  
 Loading/QC data of Pancreatic NETs for case series.  
 
-**01_loading_and_normalizingPulmNET.rmd** *R markdownfile*  
-**01_loading_and_normalizingPulmNET.html** *Final run of markdownfile as HTML output, download to open in browser*  
-Loading/QC data of Pulmonary NETs.  
+**01_loading_and_normalizingPan_ilealNET_caseseries.rmd** *R markdownfile*  
+**01_loading_and_normalizingPan_ilealNET_caseseries.html** *Final run of markdownfile as HTML output, download to open in browser*  
+Loading/QC data of Pancreatic + Ileal NETs for case series.  
+
+**01_loading_and_normalizingPulmNET_caseseries.rmd** *R markdownfile*  
+**01_loading_and_normalizingPulmNET_caseseries.html** *Final run of markdownfile as HTML output, download to open in browser*  
+Loading/QC data of Pulmonary NETs for case series.  
 
 **01_loading_and_normalizingUMCU.rmd** *R markdownfile*  
 **01_loading_and_normalizingUMCU.html** *Final run of markdownfile as HTML output, download to open in browser*  
@@ -48,11 +56,19 @@ Simulate missing data.
 
 **05_lymphocontamination.rmd** *R markdownfile*  
 **05_lymphocontamination.html** *Final run of markdownfile as HTML output, download to open in browser*  
-Simulate impurities/lymphocyte contamination.  
+Simulate impurities/normal cell contamination.  
+
+**06_analysis_paired_cases.rmd** *R markdownfile*  
+**06_analysis_paired_cases.html** *Final run of markdownfile as HTML output, download to open in browser*  
+Methylation profiles from paired primary and metastases.  
+
+**07_correlation.rmd** *R markdownfile*  
+**07_correlation.html** *Final run of markdownfile as HTML output, download to open in browser*  
+Correlation between samples in training cohort 
 
 **08_table_one_supplement.rmd** *R markdownfile*  
 **08_table_one_supplement.html** *Final run of markdownfile as HTML output, download to open in browser*  
-Describe cohort chracteristics.  
+Describe cohort characteristics.  
 
 **09_finalmodel.rmd** *R markdownfile*  
 **09_finalmodel.html** *Final run of markdownfile as HTML output, download to open in browser*  
