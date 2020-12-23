@@ -1,8 +1,10 @@
 # NEN-ID
 Determine the origin of neuroendocrine tumors with DNA methylation profiling.  
-
-*Full manuscript data analysis code will be published at acceptance.*
-
+  
+Publication:  
+Genome methylation accurately predicts neuroendocrine tumor origin - an online tool
+Wenzel M. Hackeng, Koen M.A. Dreijerink, Wendy W J de Leng, Folkert H. Morsink, Gerlof D. Valk, Menno R. Vriens, G. Johan A. Offerhaus, Christoph Geisenberger and Lodewijk A.A. Brosens Clin Cancer Res December 22 2020 DOI: 10.1158/1078-0432.CCR-20-3281  
+  
 For raw data analysis package and website see  
 https://github.com/cgeisenberger/crystalmeth  
 https://github.com/cgeisenberger/methedrine  
