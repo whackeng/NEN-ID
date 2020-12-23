@@ -1,0 +1,943 @@
+---
+title: "09-finalmodel"
+author: "Wenzel Hackeng"
+date: "22/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+First call the required packages 
+```{r message=FALSE, warning=FALSE}
+library('caret')
+library('splitstackshape')
+library('matrixStats')
+library('randomForest')
+library('glmnet')
+library('ggtern')
+library('tidyverse')
+library('cowplot')
+library('ggsci')
+library('ggpubr')
+```
+
+# Functions for analyses
+```{r message=FALSE, warning=FALSE}
+# Function determine most variable positions by downsampling with 3 repeats, function requires MatrixStats and caret
+DownSampMVP<-function(df){
+  downsampnames<-list()
+  # three random downsamples on only groups and sample names for speed.
+  df$RowNames<-rownames(df)
+  for(i in 1:3){
+      downsampnames[[i]]<-downSample(df[,"RowNames"],df[,"Sample_Group"], list=FALSE)
+  }
+
+  # Lapply merge with beta values, remove first two columns (names and class), and transpose. Sample names are     not relevant as searching for the most variable positions. 
+  downsamples<-lapply(downsampnames,function(x,y){merge(x, y, by.x=names(x)[1], by.y="RowNames")},df[,!names(df) %in% c("Sample_Group")])
+  downsamples<-lapply(downsamples, "[", -c(1, 2))
+  downsamples<-lapply(downsamples,function(x){t(x)})
+
+  # Inefficient way of ordering probes by mean absolute standard deviation
+  a<-downsamples[[1]]
+  b<-downsamples[[2]]
+  c<-downsamples[[3]]
+  amads=apply(a,1,mad)
+  bmads=apply(b,1,mad)
+  cmads=apply(c,1,mad)
+  amergedmad<-as.data.frame(a[rev(order(amads)),])
+  bmergedmad<-as.data.frame(b[rev(order(bmads)),])
+  cmergedmad<-as.data.frame(c[rev(order(cmads)),])
+  amergedmad$ordera<-1:nrow(amergedmad)
+  bmergedmad$orderb<-1:nrow(bmergedmad)
+  cmergedmad$orderc<-1:nrow(cmergedmad)
+
+  # Selecting probes by the minimal rank of the mean absolute standard deviation over all downsamples. 
+  MVprobes<-merge(amergedmad, bmergedmad, by.x= "row.names", by.y= "row.names")
+  MVprobes<-merge(MVprobes, cmergedmad, by.x= "Row.names", by.y= "row.names")
+  rownames(MVprobes) <- MVprobes[,1]
+  MVprobes[,1] <-NULL
+  MVprobes<-MVprobes[,c("ordera","orderb","orderc")]
+  MVprobes$min <- rowMins(as.matrix(MVprobes))
+  MVprobes$max <- rowMaxs(as.matrix(MVprobes))
+  MVprobes <-MVprobes[order(MVprobes$max, decreasing = FALSE),]
+  bestprobesMVP<-MVprobes[1:5000,c("min", "max")]
+  return(bestprobesMVP)
+}
+
+# Functions to add annotation data to MVP and Test and change to trainvalMVPs to numeric
+prepMVP<-function(df){
+  dfx<-as.data.frame(t(df))
+  dfx[]<-lapply(dfx, function(x) as.numeric(as.character(x)))
+  MVPdata<- merge(pd, dfx, by.x="Sample_Name", by.y = "row.names", sort = FALSE)
+  rownames(MVPdata)<-MVPdata[,1]
+  MVPdata[,1]<-NULL
+  return(MVPdata)
+}
+# Function for Random forest with with downsampling for number of group cases
+RFdownsamp<-function(x){ # x = trainval set
+  temp<-summary(x[["Sample_Group"]])
+  Smallesttemp<-min(temp)
+  Groupstemp<-length(temp)
+  MVPmodeltemp<-randomForest(Sample_Group~.,data=x, ntree=Trees, mtry = sqrt(ncol(x)-1), importance=TRUE, sampsize=rep(Smallesttemp, Groupstemp)) 
+  oob<-tail(MVPmodeltemp$err.rate[,1], n=1)
+  return(list(RFmodel=MVPmodeltemp, OOBerror=oob))
+}
+
+# Function nested CV lambda 1se
+nestCVlambda<-function(x){ # x= rfmodel
+  model<-x # input RF model
+  votes<-model$votes # get raw scores for fit_score file
+  origin<-as.data.frame(model$y)
+  colnames(origin)[1] <- "Origin"
+  fit_score<-merge(votes, origin, by.x = "row.names", by.y = "row.names")
+  row.names(fit_score)<-fit_score[,1]
+  fit_score[,1]<-NULL
+  # make matrix 
+  x <- model.matrix(Origin~., fit_score)[,-1]
+  # Convert the outcome (class) to a numerical variable
+  y <- as.factor(fit_score$Origin)
+  # try different lambda ridge penalties in 3fold cross validation
+  cv <- cv.glmnet(x, y, family = "multinomial", alpha = Alpha, nfolds = Nfolds)
+  # L2 ridge regression regression model with best lambda
+  L2reg_model <- glmnet(x, y, family = "multinomial",  alpha = Alpha, lambda = cv[[Lambda]])
+  return(list(Ridgemodel=L2reg_model, Lmin = cv$lambda.min, L1se = cv$lambda.1se))
+}
+
+
+# Function to test RF in Testfold
+TestRFprediction<-function(x, y, z) { # x = RFmodel, y = new data, z = true sample group
+  TestRFprediction<-predict(x, y, type = 'response')
+  TestRFvotes<-predict(x, y, type = 'vote')
+  OutputResponse<-(table(TestRFprediction, actual = z))
+  rf_acc_calc<-data.frame(as.character(z),as.character(TestRFprediction),stringsAsFactors=FALSE)
+  Accuracy=sum(rf_acc_calc[,1]==rf_acc_calc[,2], na.rm = TRUE)/nrow(rf_acc_calc)
+  return(list(Table = OutputResponse, Accuracy = Accuracy, Votes = TestRFvotes, Prediction = TestRFprediction))
+}
+
+# Function to test LR model in Testfold
+TestLRprediction<-function(x, y, z){ # x = LRmodel, y = RF votes of new data, z = true sample group
+  TestLRprediction<-predict(x, newx = y, s = Lambda, type = "class")
+  TestLRprob<-predict(x, newx = y, s = Lambda, type = "response")
+  OutputResponse<-(table(TestLRprediction, actual = z))
+  lr_acc_calc<-data.frame(as.character(z),as.character(TestLRprediction),stringsAsFactors=FALSE)
+  Accuracy=sum(lr_acc_calc[,1]==lr_acc_calc[,2], na.rm = TRUE)/nrow(lr_acc_calc)
+  return(list(Table = OutputResponse, Accuracy = Accuracy, Prob = TestLRprob, Prediction = TestLRprediction))
+}
+
+# Function impute beta values
+impute_random <- function(mat){
+  stopifnot(is.matrix(mat))
+  
+  if (all(is.na(mat))) {
+    warning("No non-NA data points, returning object unchanged")
+    na_num <- nrow(mat)
+    return(list(imputed = mat, n = na_num))
+  } else {
+    na_pos <- is.na(mat)
+    na_num <- sum(na_pos)
+    mat[na_pos] <- sample(x = mat[!na_pos], size = na_num, replace = TRUE)
+    return(list(imputed = mat, n = na_num))
+  }
+}
+
+```
+
+# Load data
+```{r load data, message=FALSE, warning=FALSE}
+load('./01_preprocessing/PreProcessedDataSets/GEOMERGED/GEOMERGED.rData')
+load('./01_preprocessing/PreProcessedDataSets/UMCU/preprocessedUMCU.rData')
+load('./01_preprocessing/PreProcessedDataSets/SIotherGSE73832/preprocessedSIotherGSE73832.rData')
+load('./01_preprocessing/PreProcessedDataSets/GSE53051/preprocessedPancreasCasesGSE53051.rData')
+load('./01_preprocessing/PreProcessedDataSets/GSE134089/preprocessedGSE134089.rData')
+load('./01_preprocessing/PreProcessedDataSets/GIotherGSE73832/preprocessedGIotherGSE73832.rData')
+load('./01_preprocessing/PreProcessedDataSets/EGAD00010001720/preprocessedEGAD00010001720.rData')
+PD_data_tcga_primaries <- readRDS("./RAW/TCGA/Tumor/PD_data-tcga-primaries.rds")
+data_tcga_primaries <- as.data.frame(readRDS("./RAW/TCGA/Tumor/data-tcga-primaries.rds"))
+PD_data_tcga_normal <- readRDS("./RAW/TCGA/Normal/tcga-normal-metadata.rds")
+data_tcga_normal <- as.data.frame(readRDS("./RAW/TCGA/Normal/tcga-normal-data.rds"))
+
+EPIC_probes<-read_csv("./RAW/infinium-methylationepic-v-1-0-b5-manifest-file.csv", col_types = cols(Coordinate_36 = col_character()), 
+    skip = 7)[,c(1,2)]
+PD_combined<-read.csv("./PD_FILES/PD_combined.csv", header=TRUE)
+PD_onlinetestcohort<-read.csv("./PD_FILES/PD_onlinetestcohort.csv", header=TRUE)
+PD_localtestcohort<-read.csv("./PD_FILES/PD_localtestcohort.csv", header=TRUE)
+PD_otherNENcohort<-read.csv("./PD_FILES/PD_otherNENcohort.csv", header=TRUE)
+```
+
+# Prepare data 
+General preparing of data for further analysis. 
+```{r prepare data training, message=FALSE, warning=FALSE}
+# merge 450k and EPIC to select overlapping and complete probes
+EPIC_probes[,1]<-"x" 
+
+# merge 450k training cohort data and EPIC manifest probes to select overlapping probes
+input<-merge(EPIC_probes, merged, by.x="Name", by.y="row.names")
+rownames(input) <- input[,1]
+GEO_overlap_probes <- input[,1:2]
+input[,1:2] <- NULL
+
+# prepare sample group data training data
+pd<-PD_combined[1:69,]
+pd$Sample_Group<-as.factor(as.character(pd$Sample_Group))
+pd<-pd[,c("Sample_Name","Sample_Group")]
+
+# Merge the annotation with betas training cohort
+annoinput<-merge(t(input), pd, by.x="row.names", by.y="Sample_Name")
+rownames(annoinput)<-annoinput[,1]
+annoinput[,1]<-NULL
+
+```
+
+
+```{r prepare and combine data test, message=FALSE, warning=FALSE}
+Seed<-13 # for repeatability
+set.seed(Seed)
+# prepare UMCU test cohort and randomly impute missings
+UMCU_test_partition<-as.data.frame(mynormUMCU[, names(as.data.frame(mynormUMCU)) %in% 
+c("1LCasePan","2LCasePan","3LCasePan","4InCasePan","5MCasePan",
+"6M2CasePan","Lung_NEN_MEN1","NET-UP","Ileum_met_spor_NET","Ileum_prim_spor_NET","Lung_NEN_sporadic1","Lung_NEN_sporadic2","NET-UP2", "prim-met5In", "prim-met6M1","prim-met6In", "Lung_NEN_sporadic3", "Lung_NEN_sporadic4",  "Lung_NEN_sporadic5", "Lung_NEN_sporadic6", "Lung_met_NEN_sporadic1",
+"Lung_NEN_sporadic7", "Lung_NEN_sporadic8", "Lung_NEN_sporadic9",    
+"Ileum_met_spor_NET2", "Ileum_met_spor_NET3"), drop = F])
+UMCU_test_partition<-merge(GEO_overlap_probes, UMCU_test_partition, by.x="Name", by.y="row.names", all=TRUE)
+rownames(UMCU_test_partition) <- UMCU_test_partition[,1]
+UMCU_test_partition[,1:2] <- NULL
+UMCU_test_partition_im<-as.data.frame(impute_random(as.matrix(UMCU_test_partition))[[1]])
+
+# prepare Other Small intestinal NETs and randomly impute missings
+SI_Karpathakis_test_partition<-merge(GEO_overlap_probes, as.data.frame(mynormSIotherGSE73832), by.x="Name", by.y="row.names", all = TRUE)
+rownames(SI_Karpathakis_test_partition) <- SI_Karpathakis_test_partition[,1]
+SI_Karpathakis_test_partition[,1:2] <- NULL #also remove columns from GEO cleas
+SI_Karpathakis_test_partition_im<-as.data.frame(impute_random(as.matrix(SI_Karpathakis_test_partition))[[1]])
+
+# prepare Other pancreatic NETs and randomly impute missings
+Pan_Timp_test_partition<-merge(GEO_overlap_probes, as.data.frame(GSE53051pancreasbetas), by.x="Name", by.y="row.names", all = TRUE)
+rownames(Pan_Timp_test_partition) <- Pan_Timp_test_partition[,1]
+Pan_Timp_test_partition[,1:2] <- NULL #also remove columns from GEO cleas
+Pan_Timp_test_partition_im<-as.data.frame(impute_random(as.matrix(Pan_Timp_test_partition))[[1]])
+
+# prepare Other pancreatic/SI NETs and randomly impute missings
+PanSI_Tirosh_test_partition<-merge(GEO_overlap_probes, mynormGSE134089cases, by.x="Name", by.y="row.names", all = TRUE)
+rownames(PanSI_Tirosh_test_partition) <- PanSI_Tirosh_test_partition[,1]
+PanSI_Tirosh_test_partition[,1:2] <- NULL #also remove columns from GEO cleas
+PanSI_Tirosh_test_partition_im<-as.data.frame(impute_random(as.matrix(PanSI_Tirosh_test_partition))[[1]])
+
+# prepare other pulmonary NETs and randomly impute missings
+Pulm_Alcala_test_partition<-merge(GEO_overlap_probes, mynormEGAD00010001720_UNIQ, by.x="Name", by.y="row.names", all = TRUE)
+rownames(Pulm_Alcala_test_partition) <- Pulm_Alcala_test_partition[,1]
+Pulm_Alcala_test_partition[,1:2] <- NULL #also remove columns from GEO cleas
+Pulm_Alcala_test_partition_im<-as.data.frame(impute_random(as.matrix(Pulm_Alcala_test_partition))[[1]])
+
+# prepare TCGA tumors and randomly impute missings
+data_tcga_primaries<-merge(GEO_overlap_probes, data_tcga_primaries, by.x="Name", by.y="row.names", all = TRUE)
+rownames(data_tcga_primaries) <- data_tcga_primaries[,1]
+data_tcga_primaries[,1:2] <- NULL #also remove columns from GEO cleas
+data_tcga_primaries_im<-as.data.frame(impute_random(as.matrix(data_tcga_primaries))[[1]])
+
+# prepare TCGA normals and randomly impute missings
+data_tcga_normal<-merge(GEO_overlap_probes, data_tcga_normal, by.x="Name", by.y="row.names", all = TRUE)
+rownames(data_tcga_normal) <- data_tcga_normal[,1]
+data_tcga_normal[,1:2] <- NULL #also remove columns from GEO cleas
+data_tcga_normal_im<-as.data.frame(impute_random(as.matrix(data_tcga_normal))[[1]])
+
+# Merge online test betas
+temp<-merge(SI_Karpathakis_test_partition_im, Pan_Timp_test_partition_im, by.x="row.names", by.y="row.names")
+temp<-merge(temp, PanSI_Tirosh_test_partition_im, by.x="Row.names", by.y="row.names")
+onlinetestcohort<-merge(temp, Pulm_Alcala_test_partition_im, by.x="Row.names", by.y="row.names")
+rownames(onlinetestcohort) <- onlinetestcohort[,1]
+onlinetestcohort[,1] <- NULL
+pdonlinetest<-rbind(PD_onlinetestcohort[,c("Sample_Name","Sample_Group")],PD_EGAD00010001720_UNIQ[,c("Sample_Name","Sample_Group")])
+
+inputlocaltest<-UMCU_test_partition_im # the input test dataframe with beta values
+pdlocaltest<-PD_localtestcohort[,c("Sample_Name","Sample_Group")]
+
+
+#  Merge the annotation with betas local test cohort 
+annoinputlocaltest<-merge(pdlocaltest,t(UMCU_test_partition_im), by.x="Sample_Name", by.y="row.names")
+rownames(annoinputlocaltest)<-annoinputlocaltest[,1]
+annoinputlocaltest[,1]<-NULL
+
+#  Merge the annotation with betas online test cohort 
+annoinputonlinetest<-merge(pdonlinetest,t(onlinetestcohort), by.x="Sample_Name", by.y="row.names")
+rownames(annoinputonlinetest)<-annoinputonlinetest[,1]
+annoinputonlinetest[,1]<-NULL
+```
+
+
+```{r prepare and combine data test other GI NETs, message=FALSE, warning=FALSE}
+# prepare Other GI NETs and randomly impute missings
+Seed<-13 # for repeatability
+set.seed(Seed)
+GI_Karpathakis_test_partition<-merge(GEO_overlap_probes, as.data.frame(mynormGIotherGSE73832), by.x="Name", by.y="row.names", all = TRUE)
+rownames(GI_Karpathakis_test_partition) <- GI_Karpathakis_test_partition[,1]
+GI_Karpathakis_test_partition[,1:2] <- NULL #also remove columns from GEO cleas
+GI_Karpathakis_test_partition_im<-as.data.frame(impute_random(as.matrix(GI_Karpathakis_test_partition))[[1]])
+
+# prepare Other GI NETs and randomly impute missings
+GI_Tirosh_test_partition<-merge(GEO_overlap_probes, mynormGSE134089otherGI, by.x="Name", by.y="row.names", all = TRUE)
+rownames(GI_Tirosh_test_partition) <- GI_Tirosh_test_partition[,1]
+GI_Tirosh_test_partition[,1:2] <- NULL #also remove columns from GEO cleas
+GI_Tirosh_test_partition_im<-as.data.frame(impute_random(as.matrix(GI_Tirosh_test_partition))[[1]])
+
+# Merge test betas
+OtherNENcohort<-merge(GI_Karpathakis_test_partition_im, GI_Tirosh_test_partition_im, by.x="row.names", by.y="row.names")
+
+rownames(OtherNENcohort) <- OtherNENcohort[,1]
+OtherNENcohort[,1] <- NULL
+
+inputotherNEN<-OtherNENcohort # the input test dataframe with beta values
+pdotherNEN<-PD_otherNENcohort[,c("Sample_Name","Sample_Group")]
+
+#  Merge the annotation with betas test cohort 
+annoinputotherNEN<-merge(pdotherNEN,t(inputotherNEN), by.x="Sample_Name", by.y="row.names")
+rownames(annoinputotherNEN)<-annoinputotherNEN[,1]
+annoinputotherNEN[,1]<-NULL
+
+```
+
+
+
+# Final model NEN-ID
+RF model based on most variable positions as determined by the downsampled mean absolute standard deviation, nested crossvalidation to build ridge regression calibration
+```{r Final Model, message=FALSE, warning=FALSE}
+
+# general method choices
+Seed<-13 # for repeatability
+# Random forest indicators
+Trees<-500
+# Ridge Regression indicators
+Lambda<-"lambda.1se" # or lambda.min
+Alpha <- 0 # 0 = Ridge regression, 1 = Lasso
+Nfolds <- 3 #fold CV
+
+
+# Making final model on complete training data
+set.seed(Seed)
+
+# get MVPs for training cohort sets #9minutes
+MVPs<-DownSampMVP(annoinput)
+  
+# merge MVPs with trainingsets
+MVPsTrain<-merge(MVPs, t(annoinput), by.x= "row.names", by.y= "row.names")
+rownames(MVPsTrain) <- MVPsTrain[,1]
+MVPsTrain[,1:3] <-NULL
+MVPsTrain<-prepMVP(MVPsTrain)
+  
+#build final random forest model on online cohort
+finalRF<-RFdownsamp(MVPsTrain)
+
+# build ridge logistic regression on raw random forest scores with 3 fold lambda optimization
+finalLR<-nestCVlambda(finalRF[["RFmodel"]])
+
+newdir<-"09_finalmodel"
+ifelse(!dir.exists(file.path(getwd(), newdir)), dir.create(file.path(getwd(), newdir)), FALSE)
+myfile <- file.path(paste0("./09_finalmodel/finalRF_and_LR","seed",Seed,"tr",Trees,"l",Lambda,"a",Alpha,"nf",Nfolds,".rData"))
+save(finalRF, finalLR, file = myfile)
+  
+```
+
+# Predict cases
+```{r Predict cases, message=FALSE, warning=FALSE}
+### local test cohort
+#random forest model (raw scores and class)
+predictRFlocaltestcohort<-TestRFprediction(finalRF[["RFmodel"]],annoinputlocaltest[,2:ncol(annoinputlocaltest)],annoinputlocaltest[,"Sample_Group"])
+  
+#logistic regression model (probabilities and class)
+predictLRlocaltestcohort<-TestLRprediction(finalLR[["Ridgemodel"]], predictRFlocaltestcohort[["Votes"]],annoinputlocaltest[,1])
+
+### online test cohort
+#random forest model (raw scores and class)
+predictRFonlinetestcohort<-TestRFprediction(finalRF[["RFmodel"]],annoinputonlinetest[,2:ncol(annoinputonlinetest)],annoinputonlinetest[,"Sample_Group"])
+  
+#logistic regression model (probabilities and class)
+predictLRonlinetestcohort<-TestLRprediction(finalLR[["Ridgemodel"]], predictRFonlinetestcohort[["Votes"]],annoinputonlinetest[,1])
+
+### other NENs cohort
+#random forest model (raw scores and class)
+predictRFotherNENcohort<-TestRFprediction(finalRF[["RFmodel"]],annoinputotherNEN[,2:ncol(annoinputotherNEN)],annoinputotherNEN[,"Sample_Group"])
+  
+#logistic regression model (probabilities and class)
+predictLRotherNENcohort<-TestLRprediction(finalLR[["Ridgemodel"]], predictRFotherNENcohort[["Votes"]],annoinputotherNEN[,1])
+
+### tcga cohort tumors
+#random forest model (raw scores and class)
+predictRFtcgatumorcohort<-TestRFprediction(finalRF[["RFmodel"]],t(data_tcga_primaries_im),PD_data_tcga_primaries$tissue)
+  
+#logistic regression model (probabilities and class)
+predictLRtcgatumorcohort<-TestLRprediction(finalLR[["Ridgemodel"]], predictRFtcgatumorcohort[["Votes"]],PD_data_tcga_primaries$tissue)
+
+### tcga cohort normals
+#random forest model (raw scores and class)
+predictRFtcganormalcohort<-TestRFprediction(finalRF[["RFmodel"]],t(data_tcga_normal_im),PD_data_tcga_normal$tissue)
+  
+#logistic regression model (probabilities and class)
+predictLRtcganormalcohort<-TestLRprediction(finalLR[["Ridgemodel"]], predictRFtcganormalcohort[["Votes"]],PD_data_tcga_normal$tissue)
+
+gc()
+```
+
+# Plot OOB Raw Scores
+Density plot for true classes. 95%  tolerance ellipse per true class
+```{r plot oob, message=FALSE, warning=FALSE, echo = FALSE}
+# extract information from RF model and put into df
+votesRF<-finalRF[["RFmodel"]][["votes"]]
+trueRF<-as.data.frame(finalRF$RFmodel$y)
+colnames(trueRF)[1] <- "RFtrue"
+fit_scoreRF<-merge(votesRF, trueRF, by.x = "row.names", by.y = "row.names")
+row.names(fit_scoreRF)<-fit_scoreRF[,1]
+fit_scoreRF[,1]<-NULL
+
+# ggtern 
+circle.df1 <- fit_scoreRF %>% filter(RFtrue == "PanNET")
+circle.df2 <- fit_scoreRF %>% filter(RFtrue == "IlealNET")
+circle.df3 <- fit_scoreRF %>% filter(RFtrue == "PulmNET")
+
+ggtern(data = fit_scoreRF, mapping = aes_string(x = "IlealNET", y = "PanNET", z = "PulmNET")) +
+
+  scale_color_manual(values = c("#00A087B2","#E64B35B2","#4DBBD5B2"))+
+  stat_density_tern(aes(alpha = ..level.., fill = RFtrue), 
+                    geom = 'polygon', 
+                    bins = 6,
+                    color = "grey",
+                    show.legend = FALSE
+  ) +
+    geom_point(aes(color = RFtrue),size = 3, pch=16, alpha=1)+
+  scale_alpha(guide = 'none')+
+  geom_confidence_tern(data = circle.df1, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df2, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df3, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  theme_rotate()+
+  theme_classic()+
+  theme(
+    axis.line = element_line(colour = "grey"),
+    legend.key=element_blank(),
+    legend.background=element_blank())+
+  labs(fill = "True Class")
+
+```
+
+# Plot Calibrated Scores OOB
+Density plot for true classes. 95%  tolerance ellipse per true class
+```{r plot calibrated oob, message=FALSE, warning=FALSE}
+votesLR<-predict(finalLR$Ridgemodel, newx = votesRF, s = Lambda, type = "response")
+df<-predict(finalLR$Ridgemodel, newx = votesRF, s = Lambda, type = "class")
+trueLR<-as.data.frame(finalRF$RFmodel$y)
+colnames(trueLR)[1] <- "LRtrue"
+fit_scoreLR<-merge(votesLR, trueLR, by.x = "row.names", by.y = "row.names")
+row.names(fit_scoreLR)<-fit_scoreLR[,1]
+fit_scoreLR[,1]<-NULL
+colnames(fit_scoreLR)<-c("Ileum", "Pancreas", "Lung", "LRtrue")
+
+# ggtern 
+circle.df4 <- fit_scoreLR %>% filter(LRtrue == "PanNET")
+circle.df5 <- fit_scoreLR %>% filter(LRtrue == "IlealNET")
+circle.df6 <- fit_scoreLR %>% filter(LRtrue == "PulmNET")
+
+ggtern(data = fit_scoreLR, mapping = aes_string(x = "Ileum", y = "Pancreas", z = "Lung")) +
+  scale_color_manual(values = c("#00A087B2","#E64B35B2","#4DBBD5B2"))+
+  stat_density_tern(aes(alpha = ..level.., fill = LRtrue), 
+                    geom = 'polygon', 
+                    bins = 10,
+                    color = "grey",
+                    show.legend = FALSE
+  ) +
+  scale_alpha(guide = 'none')+
+  geom_point(aes(color = LRtrue),size = 3, pch=16, alpha = 1)+
+  geom_confidence_tern(data = circle.df4, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df5, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df6, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  theme_rotate()+
+  theme_classic()+
+  theme(
+    axis.line = element_line(colour = "grey"),
+    legend.key=element_blank(),
+    legend.background=element_blank())+
+  labs(fill = "True Class")
+```
+# Plot raw scores online test cohort with training set OOB calibrated tolerance ellipse
+```{r plot raw online test cohort, message=FALSE, warning=FALSE}
+onlineTestRFprob<-as.data.frame(predictRFonlinetestcohort$Votes)
+colnames(onlineTestRFprob)<-c("IlealNET", y = "PanNET", z = "PulmNET")
+ggtern(data = onlineTestRFprob, mapping = aes_string("IlealNET", y = "PanNET", z = "PulmNET"))+
+     geom_point(aes(color = factor(annoinputonlinetest[,"Sample_Group"]), shape = factor(annoinputonlinetest[,"Sample_Group"])),size = 2, alpha =1)+
+  scale_alpha(guide = 'none')+
+  geom_confidence_tern(data = circle.df1, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df2, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df3, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  theme_classic()+
+  scale_shape_manual(labels = c("Case unknown primary", "Meta Liver SI-NET", "Meta NOS SI-NET", "Meta Omentum SI-NET", "PanNET", "Primary SINOS", "SI", "Lung NET"),values=1:nlevels(annoinputonlinetest[,"Sample_Group"]))+
+  scale_color_manual(labels = c("Case unknown primary", "Meta Liver SI-NET", "Meta NOS SI-NET", "Meta Omentum SI-NET", "PanNET", "Primary SINOS", "SI", "Lung NET"), values = c("purple", "#00A087B2","#00A087B2","#00A087B2", "#E64B35B2", "#00A087B2", "#00A087B2","#4DBBD5B2"))+
+  labs(color="Samples", shape="Samples")
+
+
+ggsave("onlineTestcohortRFzoomfar.eps", path = "./09_finalmodel/", width = 30,
+  height = 20,
+  units = "in")
+ggsave("onlineTestcohortRFzoomclose.eps", path = "./09_finalmodel/", width = 6,
+  height = 4,
+  units = "in")
+```
+
+# Plot calibrated scores online test cohort with training set OOB calibrated  tolerance ellipse
+```{r plot calibrated online test cohort, message=FALSE, warning=FALSE}
+onlineTestLRprob<-as.data.frame(predictLRonlinetestcohort$Prob)
+colnames(onlineTestLRprob)<-c("Ileum", "Pancreas", "Lung")
+ggtern(data = onlineTestLRprob, mapping = aes_string(x = "Ileum", y = "Pancreas", z = "Lung"))+
+  geom_point(aes(color = factor(annoinputonlinetest[,"Sample_Group"]), shape = factor(annoinputonlinetest[,"Sample_Group"])),size = 2, alpha =1)+
+  scale_alpha(guide = 'none')+
+  geom_confidence_tern(data = circle.df4, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df5, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df6, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  theme_classic()+
+  scale_shape_manual(labels = c("Case unknown primary", "Meta Liver SI-NET", "Meta NOS SI-NET", "Meta Omentum SI-NET", "PanNET", "Primary SINOS", "SI", "Lung NET"),values=1:nlevels(annoinputonlinetest[,"Sample_Group"]))+
+  scale_color_manual(labels = c("Case unknown primary", "Meta Liver SI-NET", "Meta NOS SI-NET", "Meta Omentum SI-NET", "PanNET", "Primary SINOS", "SI", "Lung NET"), values = c("purple", "#00A087B2","#00A087B2","#00A087B2", "#E64B35B2", "#00A087B2", "#00A087B2","#4DBBD5B2"))+
+  labs(color="Samples", shape="Samples")
+
+
+ggsave("onlineTestcohortLRzoomfar.eps", path = "./09_finalmodel/", width = 30,
+  height = 20,
+  units = "in")
+ggsave("onlineTestcohortLRzoomclose.eps", path = "./09_finalmodel/", width = 6,
+  height = 4,
+  units = "in")
+```
+
+```{r}
+table(annoinputonlinetest[,"Sample_Group"],predictLRonlinetestcohort$Prediction)
+```
+
+
+
+
+# Plot raw scores local test cohort with training set OOB calibrated tolerance ellipse
+```{r plot raw local test cohort, message=FALSE, warning=FALSE}
+localTestRFprob<-as.data.frame(predictRFlocaltestcohort$Votes)
+colnames(localTestRFprob)<-c("IlealNET", y = "PanNET", z = "PulmNET")
+ggtern(data = localTestRFprob, mapping = aes_string("IlealNET", y = "PanNET", z = "PulmNET"))+
+  scale_color_manual(values = c("purple", "#4DBBD5B2","#E64B35B2","#00A087B2"))+
+    geom_point(aes(color = annoinputlocaltest[,"Sample_Group"]),size = 3, pch=16, alpha = 1)+
+  scale_alpha(guide = 'none')+
+  geom_confidence_tern(data = circle.df1, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df2, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df3, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  theme_classic()+
+  labs(color="Samples")
+
+ggsave("localTestcohortRFzoomfar.eps", path = "./09_finalmodel/", width = 30,
+  height = 20,
+  units = "in")
+ggsave("localTestcohortRFzoomclose.eps", path = "./09_finalmodel/", width = 6,
+  height = 4,
+  units = "in")
+```
+
+# Plot calibrated scores local test cohort with training set OOB calibrated  tolerance ellipse
+```{r plot calibrated local test cohort, message=FALSE, warning=FALSE}
+localTestLRprob<-as.data.frame(predictLRlocaltestcohort$Prob)
+colnames(localTestLRprob)<-c("Ileum", "Pancreas", "Lung")
+ggtern(data = localTestLRprob, mapping = aes_string(x = "Ileum", y = "Pancreas", z = "Lung"))+
+  scale_color_manual(values = c("purple", "#4DBBD5B2","#E64B35B2","#00A087B2"))+
+    geom_point(aes(color = annoinputlocaltest[,"Sample_Group"]),size = 3, pch=16, alpha = 1)+
+  scale_alpha(guide = 'none')+
+  geom_confidence_tern(data = circle.df4, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df5, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df6, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  theme_classic()+
+  labs(color="Samples")
+
+ggsave("localTestcohortLRzoomfar.eps", path = "./09_finalmodel/", width = 30,
+  height = 20,
+  units = "in")
+ggsave("localTestcohortLRzoomclose.eps", path = "./09_finalmodel/", width = 6,
+  height = 4,
+  units = "in")
+```
+
+```{r}
+table(annoinputlocaltest[,"Sample_Group"],predictLRlocaltestcohort$Prediction)
+```
+
+# Testing case series NET-UP
+```{r testing NET-UP case series, message=FALSE, warning=FALSE}
+
+TestLRprobNETUPcase<-as.data.frame(predictLRlocaltestcohort$Prob)
+colnames(TestLRprobNETUPcase)<-c("Ileum", "Pancreas", "Lung")
+
+TestLRprobNETUPcase1<-as.data.frame(TestLRprobNETUPcase)["Lung_NEN_MEN1",]
+TestLRprobNETUPcase2<-as.data.frame(TestLRprobNETUPcase)["NET-UP",]
+TestLRprobNETUPcase3<-as.data.frame(TestLRprobNETUPcase)["NET-UP2",]
+
+
+ggtern(data = TestLRprobNETUPcase1, mapping = aes_string(x = "Ileum", y = "Pancreas", z = "Lung"))+
+  geom_point(size = 4, pch=21, color="red", fill="red")+
+  geom_confidence_tern(data = circle.df4, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df5, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df6, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  theme_classic()
+ggsave("MEN1ternary.eps", path = "./09_finalmodel/", width = 4,
+  height = 4,
+  units = "in")
+
+ggtern(data = TestLRprobNETUPcase2, mapping = aes_string(x = "Ileum", y = "Pancreas", z = "Lung"))+
+  geom_point(size = 4, pch=21, color="red", fill="red")+
+  geom_confidence_tern(data = circle.df4, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df5, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df6, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  theme_classic()
+ggsave("NETUP1ternary.eps", path = "./09_finalmodel/", width = 4,
+  height = 4,
+  units = "in")
+
+ggtern(data = TestLRprobNETUPcase3, mapping = aes_string(x = "Ileum", y = "Pancreas", z = "Lung"))+
+  geom_point(size = 4, pch=21, color="red", fill="red")+
+  geom_confidence_tern(data = circle.df4, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df5, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df6, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  theme_classic()
+ggsave("NETUP2ternary.eps", path = "./09_finalmodel/", width = 4,
+  height = 4,
+  units = "in")
+
+
+```
+
+# Plot calibrated scores other NEN cohort with training set OOB calibrated  tolerance ellipse
+```{r plot calibrated other NEN cohort, message=FALSE, warning=FALSE}
+otherNENLRprob<-as.data.frame(predictLRotherNENcohort$Prob)
+colnames(otherNENLRprob)<-c("Ileum", "Pancreas", "Lung")
+ggtern(data = otherNENLRprob, mapping = aes_string(x = "Ileum", y = "Pancreas", z = "Lung"))+
+  scale_fill_manual(values = c("red","blue","green","purple","orange"))+
+    geom_point(aes(fill = annoinputotherNEN[,"Sample_Group"]),size = 2, pch=21, color="black")+
+  scale_alpha(guide = 'none')+
+  geom_confidence_tern(data = circle.df4, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df5, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  geom_confidence_tern(data = circle.df6, color="black", alpha = 1, linetype = 2,   breaks = c(0.95))+
+  theme_classic()
+
+ggsave("otherNENcohortzoomfar.eps", path = "./09_finalmodel/", width = 30,
+  height = 20,
+  units = "in")
+ggsave("otherNENcohortzoomclose.eps", path = "./09_finalmodel/", width = 6,
+  height = 4,
+  units = "in")
+```
+
+# General stastistics model OOB
+including oob mean and median votes for classes and distribution of class votes in training cohort 
+```{r general statistics, message=FALSE, warning=FALSE}
+oob<-cbind(as.data.frame(finalRF[[1]][[6]]),as.data.frame(as.character(finalRF[[1]][[16]])))
+names(oob)[4]<-"Sample_Group"
+
+oobsummary <- matrix(nrow=6, ncol=7)
+oobsummary[1,1:6]<-summary(unlist(subset(oob, Sample_Group == "IlealNET", select=c(IlealNET))))
+oobsummary[1,7]<-sd(unlist(subset(oob, Sample_Group == "IlealNET", select=c(IlealNET))))
+oobsummary[2,1:6]<-summary(unlist(subset(oob, Sample_Group == "PanNET", select=c(PanNET))))
+oobsummary[2,7]<-sd(unlist(subset(oob, Sample_Group == "PanNET", select=c(PanNET))))
+oobsummary[3,1:6]<-summary(unlist(subset(oob, Sample_Group == "PulmNET", select=c(PulmNET))))
+oobsummary[3,7]<-sd(unlist(subset(oob, Sample_Group == "PulmNET", select=c(PulmNET))))
+
+
+LRprob<-cbind(as.data.frame(predict(finalLR$Ridgemodel, newx = finalRF[[1]][[6]], type = "response"),stringsAsFactors=FALSE),as.data.frame(as.character(finalRF[[1]][[16]])))
+names(LRprob)<-c("IlealNET", "PanNET", "PulmNET", "Sample_Group")
+
+oobsummary[4,1:6]<-summary(unlist(subset(LRprob, Sample_Group == "IlealNET", select=c(IlealNET))))
+oobsummary[4,7]<-sd(unlist(subset(LRprob, Sample_Group == "IlealNET", select=c(IlealNET))))
+oobsummary[5,1:6]<-summary(unlist(subset(LRprob, Sample_Group == "PanNET", select=c(PanNET))))
+oobsummary[5,7]<-sd(unlist(subset(LRprob, Sample_Group == "PanNET", select=c(PanNET))))
+oobsummary[6,1:6]<-summary(unlist(subset(LRprob, Sample_Group == "PulmNET", select=c(PulmNET))))
+oobsummary[6,7]<-sd(unlist(subset(LRprob, Sample_Group == "PulmNET", select=c(PulmNET))))
+
+plot1<-ggplot(as.data.frame(subset(oob, Sample_Group == "IlealNET")), aes(x=as.data.frame(subset(oob, Sample_Group == "IlealNET"))[,"IlealNET"], fill="red")) + 
+  geom_density(alpha=0.5)+
+   geom_density(data=as.data.frame(subset(LRprob, Sample_Group == "IlealNET")),aes(x=as.data.frame(subset(LRprob, Sample_Group == "IlealNET"))[,"IlealNET"],fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Ileal Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                          breaks = c("red", "blue"),
+                          labels = c("Raw RF", "Calibrated RF"),
+                          guide = "legend")+
+theme_classic()
+
+plot2<-ggplot(as.data.frame(subset(oob, Sample_Group == "PanNET")), aes(x=as.data.frame(subset(oob, Sample_Group == "PanNET"))[,"PanNET"], fill="red")) + 
+  geom_density(alpha=0.5)+
+   geom_density(data=as.data.frame(subset(LRprob, Sample_Group == "PanNET")),aes(x=as.data.frame(subset(LRprob, Sample_Group == "PanNET"))[,"PanNET"],fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Pancreatic Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                          breaks = c("red", "blue"),
+                          labels = c("Raw RF", "Calibrated RF"),
+                          guide = "legend")+
+theme_classic()
+
+plot3<-ggplot(as.data.frame(subset(oob, Sample_Group == "PulmNET")), aes(x=as.data.frame(subset(oob, Sample_Group == "PulmNET"))[,"PulmNET"], fill="red")) + 
+  geom_density(alpha=0.5)+
+   geom_density(data=as.data.frame(subset(LRprob, Sample_Group == "PulmNET")),aes(x=as.data.frame(subset(LRprob, Sample_Group == "PulmNET"))[,"PulmNET"],fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Lung Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                          breaks = c("red", "blue"),
+                          labels = c("Raw RF", "Calibrated RF"),
+                          guide = "legend")+
+theme_classic()
+
+plot_grid(plot1, plot2, plot3, align = "v", nrow = 3, rel_heights = c(1/3, 1/3, 1/3))
+
+ggsave("classscoresOOB.pdf", path = "./09_finalmodel/", width = 6,
+  height = 4,
+  units = "in")
+
+
+classscoresOOB<-as.data.frame(oobsummary, sort = FALSE)
+row.names(classscoresOOB)<-c("ileal RF","pancreatic RF","lung RF", "ileal LR","pancreatic LR","lung LR")
+colnames(classscoresOOB)<-c("Min.","1stQu.","Median", "Mean","3rdQu.","Max.", "SDev")
+myfile <- file.path(paste0("./09_finalmodel/OOBsummaryFinalModel",".rData"))
+save(classscoresOOB, file = myfile)
+classscoresOOB
+```
+
+# General stastistics local test cohort
+including mean and median votes for classes and distribution of class votes in local test cohort
+```{r general statistics local test cohort, message=FALSE, warning=FALSE}
+scoresRFlocal<-cbind(as.data.frame(predictRFlocaltestcohort[[3]]),as.data.frame(as.character(annoinputlocaltest[,"Sample_Group"])))
+names(scoresRFlocal)[4]<-"Sample_Group"
+
+scoresRFlocalsummary <- matrix(nrow=6, ncol=7)
+scoresRFlocalsummary[1,1:6]<-summary(unlist(subset(scoresRFlocal, Sample_Group == "SI", select=c(IlealNET))))
+scoresRFlocalsummary[1,7]<-sd(unlist(subset(scoresRFlocal, Sample_Group == "SI", select=c(IlealNET))))
+scoresRFlocalsummary[2,1:6]<-summary(unlist(subset(scoresRFlocal, Sample_Group == "Pancreas", select=c(PanNET))))
+scoresRFlocalsummary[2,7]<-sd(unlist(subset(scoresRFlocal, Sample_Group == "Pancreas", select=c(PanNET))))
+scoresRFlocalsummary[3,1:6]<-summary(unlist(subset(scoresRFlocal, Sample_Group == "Lung", select=c(PulmNET))))
+scoresRFlocalsummary[3,7]<-sd(unlist(subset(scoresRFlocal, Sample_Group == "Lung", select=c(PulmNET))))
+
+
+scoresLRlocal<-cbind(as.data.frame(predict(finalLR$Ridgemodel, newx = predictRFlocaltestcohort[[3]], type = "response"),stringsAsFactors=FALSE),as.data.frame(as.character(annoinputlocaltest[,"Sample_Group"])))
+names(scoresLRlocal)<-c("IlealNET", "PanNET", "PulmNET", "Sample_Group")
+
+scoresRFlocalsummary[4,1:6]<-summary(unlist(subset(scoresLRlocal, Sample_Group == "SI", select=c(IlealNET))))
+scoresRFlocalsummary[4,7]<-sd(unlist(subset(scoresLRlocal, Sample_Group == "SI", select=c(IlealNET))))
+scoresRFlocalsummary[5,1:6]<-summary(unlist(subset(scoresLRlocal, Sample_Group == "Pancreas", select=c(PanNET))))
+scoresRFlocalsummary[5,7]<-sd(unlist(subset(scoresLRlocal, Sample_Group == "Pancreas", select=c(PanNET))))
+scoresRFlocalsummary[6,1:6]<-summary(unlist(subset(scoresLRlocal, Sample_Group == "Lung", select=c(PulmNET))))
+scoresRFlocalsummary[6,7]<-sd(unlist(subset(scoresLRlocal, Sample_Group == "Lung", select=c(PulmNET))))
+
+plot1<-ggplot(as.data.frame(subset(scoresRFlocal, Sample_Group == "SI")), aes(x=as.data.frame(subset(scoresRFlocal, Sample_Group == "SI"))[,"IlealNET"], fill="red")) + 
+  geom_density(alpha=0.5)+
+   geom_density(data=as.data.frame(subset(scoresLRlocal, Sample_Group == "SI")),aes(x=as.data.frame(subset(scoresLRlocal, Sample_Group == "SI"))[,"IlealNET"],fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Ileal Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                          breaks = c("red", "blue"),
+                          labels = c("Raw RF", "Calibrated RF"),
+                          guide = "legend")+
+theme_classic()
+
+plot2<-ggplot(as.data.frame(subset(scoresRFlocal, Sample_Group == "Pancreas")), aes(x=as.data.frame(subset(scoresRFlocal, Sample_Group == "Pancreas"))[,"PanNET"], fill="red")) + 
+  geom_density(alpha=0.5)+
+   geom_density(data=as.data.frame(subset(scoresLRlocal, Sample_Group == "Pancreas")),aes(x=as.data.frame(subset(scoresLRlocal, Sample_Group == "Pancreas"))[,"PanNET"],fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Pancreatic Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                          breaks = c("red", "blue"),
+                          labels = c("Raw RF", "Calibrated RF"),
+                          guide = "legend")+
+theme_classic()
+
+plot3<-ggplot(as.data.frame(subset(scoresRFlocal, Sample_Group == "Lung")), aes(x=as.data.frame(subset(scoresRFlocal, Sample_Group == "Lung"))[,"PulmNET"], fill="red")) + 
+  geom_density(alpha=0.5)+
+   geom_density(data=as.data.frame(subset(scoresLRlocal, Sample_Group == "Lung")),aes(x=as.data.frame(subset(scoresLRlocal, Sample_Group == "Lung"))[,"PulmNET"],fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Lung Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                          breaks = c("red", "blue"),
+                          labels = c("Raw RF", "Calibrated RF"),
+                          guide = "legend")+
+theme_classic()
+
+plot_grid(plot1, plot2, plot3, align = "v", nrow = 3, rel_heights = c(1/3, 1/3, 1/3))
+
+ggsave("classscoreslocaltest.pdf", path = "./09_finalmodel/", width = 6,
+  height = 4,
+  units = "in")
+
+
+classscoreslocaltest<-as.data.frame(scoresRFlocalsummary, sort = FALSE)
+row.names(classscoreslocaltest)<-c("ileal RF","pancreatic RF","lung RF", "ileal LR","pancreatic LR","lung LR")
+colnames(classscoreslocaltest)<-c("Min.","1stQu.","Median", "Mean","3rdQu.","Max.", "SDev")
+myfile <- file.path(paste0("./09_finalmodel/scoresRFlocalsummaryFinalModel",".rData"))
+save(classscoreslocaltest, file = myfile)
+classscoreslocaltest
+```
+
+
+# General stastistics online test cohort
+including mean and median votes for classes and distribution of class votes in online test cohort
+```{r general statistics online test cohort, message=FALSE, warning=FALSE}
+scoresRFonline<-cbind(as.data.frame(predictRFonlinetestcohort[[3]]),as.data.frame(as.character(annoinputonlinetest[,"Sample_Group"])))
+names(scoresRFonline)[4]<-"Sample_Group"
+levels(scoresRFonline$Sample_Group) <- c("CaseUP", "SI", "SI","SI","Pancreas","SI","Lung","SI")
+
+scoresRFonlinesummary <- matrix(nrow=6, ncol=7)
+scoresRFonlinesummary[1,1:6]<-summary(unlist(subset(scoresRFonline, Sample_Group == "SI", select=c(IlealNET))))
+scoresRFonlinesummary[1,7]<-sd(unlist(subset(scoresRFonline, Sample_Group == "SI", select=c(IlealNET))))
+
+
+scoresRFonlinesummary[2,1:6]<-summary(unlist(subset(scoresRFonline, Sample_Group == "Pancreas", select=c(PanNET))))
+scoresRFonlinesummary[2,7]<-sd(unlist(subset(scoresRFonline, Sample_Group == "Pancreas", select=c(PanNET))))
+scoresRFonlinesummary[3,1:6]<-summary(unlist(subset(scoresRFonline, Sample_Group == "Lung", select=c(PulmNET))))
+scoresRFonlinesummary[3,7]<-sd(unlist(subset(scoresRFonline, Sample_Group == "Lung", select=c(PulmNET))))
+
+
+scoresLRonline<-cbind(as.data.frame(predict(finalLR$Ridgemodel, newx = predictRFonlinetestcohort[[3]], type = "response"),stringsAsFactors=FALSE),as.data.frame(as.character(annoinputonlinetest[,"Sample_Group"])))
+names(scoresLRonline)<-c("IlealNET", "PanNET", "PulmNET", "Sample_Group")
+levels(scoresLRonline$Sample_Group) <- c("CaseUP", "SI", "SI","SI","Pancreas","SI","Lung","SI")
+
+
+scoresRFonlinesummary[4,1:6]<-summary(unlist(subset(scoresLRonline, Sample_Group == "SI", select=c(IlealNET))))
+scoresRFonlinesummary[4,7]<-sd(unlist(subset(scoresLRonline, Sample_Group == "SI", select=c(IlealNET))))
+scoresRFonlinesummary[5,1:6]<-summary(unlist(subset(scoresLRonline, Sample_Group == "Pancreas", select=c(PanNET))))
+scoresRFonlinesummary[5,7]<-sd(unlist(subset(scoresLRonline, Sample_Group == "Pancreas", select=c(PanNET))))
+scoresRFonlinesummary[6,1:6]<-summary(unlist(subset(scoresLRonline, Sample_Group == "Lung", select=c(PulmNET))))
+scoresRFonlinesummary[6,7]<-sd(unlist(subset(scoresLRonline, Sample_Group == "Lung", select=c(PulmNET))))
+
+plot1<-ggplot(as.data.frame(subset(scoresRFonline, Sample_Group == "SI")), aes(x=as.data.frame(subset(scoresRFonline, Sample_Group == "SI"))[,"IlealNET"], fill="red")) + 
+  geom_density(alpha=0.5)+
+   geom_density(data=as.data.frame(subset(scoresLRonline, Sample_Group == "SI")),aes(x=as.data.frame(subset(scoresLRonline, Sample_Group == "SI"))[,"IlealNET"],fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Ileal Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                          breaks = c("red", "blue"),
+                          labels = c("Raw RF", "Calibrated RF"),
+                          guide = "legend")+
+theme_classic()
+
+plot2<-ggplot(as.data.frame(subset(scoresRFonline, Sample_Group == "Pancreas")), aes(x=as.data.frame(subset(scoresRFonline, Sample_Group == "Pancreas"))[,"PanNET"], fill="red")) + 
+  geom_density(alpha=0.5)+
+   geom_density(data=as.data.frame(subset(scoresLRonline, Sample_Group == "Pancreas")),aes(x=as.data.frame(subset(scoresLRonline, Sample_Group == "Pancreas"))[,"PanNET"],fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Pancreatic Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                          breaks = c("red", "blue"),
+                          labels = c("Raw RF", "Calibrated RF"),
+                          guide = "legend")+
+theme_classic()
+
+plot3<-ggplot(as.data.frame(subset(scoresRFonline, Sample_Group == "Lung")), aes(x=as.data.frame(subset(scoresRFonline, Sample_Group == "Lung"))[,"PulmNET"], fill="red")) + 
+  geom_density(alpha=0.5)+
+   geom_density(data=as.data.frame(subset(scoresLRonline, Sample_Group == "Lung")),aes(x=as.data.frame(subset(scoresLRonline, Sample_Group == "Lung"))[,"PulmNET"],fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Lung Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                          breaks = c("red", "blue"),
+                          labels = c("Raw RF", "Calibrated RF"),
+                          guide = "legend")+
+theme_classic()
+
+plot_grid(plot1, plot2, plot3, align = "v", nrow = 3, rel_heights = c(1/3, 1/3, 1/3))
+
+ggsave("classscoresonlinetest.pdf", path = "./09_finalmodel/", width = 6,
+  height = 4,
+  units = "in")
+
+
+classscoresonlinetest<-as.data.frame(scoresRFonlinesummary, sort = FALSE)
+row.names(classscoresonlinetest)<-c("ileal RF","pancreatic RF","lung RF", "ileal LR","pancreatic LR","lung LR")
+colnames(classscoresonlinetest)<-c("Min.","1stQu.","Median", "Mean","3rdQu.","Max.", "SDev")
+myfile <- file.path(paste0("./09_finalmodel/scoresRFonlinesummaryFinalModel",".rData"))
+save(classscoresonlinetest, file = myfile)
+classscoresonlinetest
+```
+
+# Average class scores known NETs vs predicted class scores unknown NETs
+```{r average class scores vs. predicted, message=FALSE, warning=FALSE}
+# detach packages to achieve working plot with axis. 
+invisible(lapply(paste0("package:", names(sessionInfo()$otherPkgs)),   
+                 detach,
+                 character.only = TRUE, unload = TRUE))
+# reattach packages
+library(ggpubr)
+library(ggsci)
+
+ScoresLR<-rbind(scoresLRlocal,scoresLRonline)
+
+# of note, true origin is used for NEN-ID known NETs, this is why scores can be below 0.33
+df1<-as.data.frame(subset(ScoresLR, Sample_Group == "SI", select=c("IlealNET", "Sample_Group")))
+colnames(df1)[1]<-"Scores"
+df2<-as.data.frame(subset(ScoresLR, Sample_Group == "Pancreas", select=c("PanNET", "Sample_Group")))
+names(df2)[1]<-"Scores"
+df3<-as.data.frame(subset(ScoresLR, Sample_Group == "Lung", select=c("PulmNET", "Sample_Group")))
+names(df3)[1]<-"Scores"
+
+# of note, predicted origin is used for NEN-ID unknown NETs and TCGA data, this is why all scores are above 0.33.
+ScoresLRotherNEN<-cbind(as.data.frame(predictLRotherNENcohort[[3]]),as.data.frame(as.character(predictLRotherNENcohort[[4]])))
+names(ScoresLRotherNEN)<-c("IlealNET", "PanNET", "PulmNET", "Sample_Group")
+df4<-as.data.frame(subset(ScoresLRotherNEN, Sample_Group == "IlealNET", select=c("IlealNET", "Sample_Group")))
+colnames(df4)[1]<-"Scores"
+df5<-as.data.frame(subset(ScoresLRotherNEN, Sample_Group == "PanNET", c(select="PanNET", "Sample_Group")))
+names(df5)[1]<-"Scores"
+df6<-as.data.frame(subset(ScoresLRotherNEN, Sample_Group == "PulmNET", select=c("PulmNET", "Sample_Group")))
+names(df6)[1]<-"Scores"
+
+ScoresLRTCGAtumor<-cbind(as.data.frame(predictLRtcgatumorcohort[[3]]),as.data.frame(as.character(predictLRtcgatumorcohort[[4]])))
+names(ScoresLRTCGAtumor)<-c("IlealNET", "PanNET", "PulmNET", "Sample_Group")
+df7<-as.data.frame(subset(ScoresLRTCGAtumor, Sample_Group == "IlealNET", select=c("IlealNET", "Sample_Group")))
+colnames(df7)[1]<-"Scores"
+df8<-as.data.frame(subset(ScoresLRTCGAtumor, Sample_Group == "PanNET", select=c("PanNET", "Sample_Group")))
+names(df8)[1]<-"Scores"
+df9<-as.data.frame(subset(ScoresLRTCGAtumor, Sample_Group == "PulmNET", select=c("PulmNET", "Sample_Group")))
+names(df9)[1]<-"Scores"
+
+ScoresLRTCGAnormal<-cbind(as.data.frame(predictLRtcganormalcohort[[3]]),as.data.frame(as.character(predictLRtcganormalcohort[[4]])))
+names(ScoresLRTCGAnormal)<-c("IlealNET", "PanNET", "PulmNET", "Sample_Group")
+df10<-as.data.frame(subset(ScoresLRTCGAnormal, Sample_Group == "IlealNET", select=c("IlealNET", "Sample_Group")))
+colnames(df10)[1]<-"Scores"
+df11<-as.data.frame(subset(ScoresLRTCGAnormal, Sample_Group == "PanNET", select=c("PanNET", "Sample_Group")))
+names(df11)[1]<-"Scores"
+df12<-as.data.frame(subset(ScoresLRTCGAnormal, Sample_Group == "PulmNET", select=c("PulmNET", "Sample_Group")))
+names(df12)[1]<-"Scores"
+
+unrealscoresNEN<-as.data.frame(rbind(df4,df5,df6))
+unrealscoresNEN$Comparison<-"NEN-ID unknown NETs"
+unrealscoresTCGAtumor<-as.data.frame(rbind(df7,df8,df9))
+unrealscoresTCGAtumor$Comparison<-"TCGA tumors"
+unrealscoresTCGAnormal<-as.data.frame(rbind(df10,df11,df12))
+unrealscoresTCGAnormal$Comparison<-"TCGA normals"
+realscores<-as.data.frame(rbind(df1,df2,df3))
+realscores$Comparison<-"NEN-ID known NETs"
+
+scores<-rbind(realscores,unrealscoresNEN, unrealscoresTCGAtumor ,unrealscoresTCGAnormal)
+scores$Comparison<-as.factor(scores$Comparison)
+levels(scores$Comparison) <- gsub(" ", "\n", levels(scores$Comparison))
+my_comparisons <- list(c("NEN-ID\nknown\nNETs", "NEN-ID\nunknown\nNETs"), c("NEN-ID\nknown\nNETs", "TCGA\ntumors"), c("NEN-ID\nknown\nNETs", "TCGA\nnormals"))
+ggboxplot(scores, x = "Comparison", y = "Scores",
+          color = "Comparison", palette = "jco",
+          add = "jitter",
+          ylim = c(0, 1.5))+
+          theme(axis.text.x = element_text(face="bold", 
+                angle=0),
+                axis.text.y = element_text(face="bold", 
+                angle=0))+
+  stat_compare_means(comparisons = my_comparisons)+ # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 1.4)
+
+ggsave("WilcoxScore.eps", path = "./09_finalmodel/", width = 7.5, height = 5, units = "in")
+
+# all calibrated scores including true origin/type
+temp1<-merge(as.data.frame(predictLRotherNENcohort[[3]]),PD_otherNENcohort[,c("Sample_Name","Sample_Group")], by.x = "row.names", by.y = "Sample_Name")
+rownames(temp1)<-temp1[,1]
+temp1[,1]<-NULL
+names(temp1)<-c("IlealNET", "PanNET", "PulmNET", "Sample_Group")
+temp2<-merge(as.data.frame(predictLRtcgatumorcohort[[3]]),PD_data_tcga_primaries[,c("basename","tissue")], by.x = "row.names", by.y = "basename")
+rownames(temp2)<-temp2[,1]
+temp2[,1]<-NULL
+names(temp2)<-c("IlealNET", "PanNET", "PulmNET", "Sample_Group")
+temp3<-merge(as.data.frame(predictLRtcganormalcohort[[3]]),PD_data_tcga_normal[,c("basename","tissue")], by.x = "row.names", by.y = "basename")
+rownames(temp3)<-temp3[,1]
+temp3[,1]<-NULL
+names(temp3)<-c("IlealNET", "PanNET", "PulmNET", "Sample_Group")
+OverviewScores<-rbind(ScoresLR,temp1,temp2,temp3)
+myfile <- file.path(paste0("./09_finalmodel/Cal_Scores_All_TestSamples",".rData"))
+save(OverviewScores,scores, file = myfile)
+
+```
+

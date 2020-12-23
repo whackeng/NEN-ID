@@ -1,0 +1,91 @@
+---
+title: "01-loading_and_normalizingPulmNET"
+author: "Wenzel Hackeng"
+date: "22/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## **Pre-processing**
+First call the required packages
+```{r message=FALSE, warning=FALSE}
+library("GEOquery")
+library("ChAMP")
+```
+# GEO load Pulmonary Neuroendocrine Tumors (Carcinoids)
+Now load the first data (Laddha et al. 2019)
+```{r eval=FALSE}
+dir.create("RAW")
+
+getGEOSuppFiles("GSE118133", makeDirectory = TRUE, baseDir =  './RAW')
+untar('./RAW/GSE118133/GSE118133_RAW.tar', exdir = './RAW/GSE118133/IdatFiles')
+```
+Now manually untar idat files and remove others. Put PD file in IdatFiles folder
+
+# ChAMP load data 
+During filtering, manually check proportion of failed probes to see if there are bad samples.
+
+```{r message=FALSE, warning=FALSE}
+dir.create("01_preprocessing")
+filesGSE118133<-'./RAW/GSE118133/IdatFiles/'
+set.seed(11)
+myloadGSE118133 <- champ.load(directory = filesGSE118133,
+                              method="ChAMP",
+                              methValue="B",
+                              autoimpute=TRUE,
+                              filterDetP=TRUE,
+                              ProbeCutoff=0,
+                              SampleCutoff=0.1,
+                              detPcut=0.01,
+                              filterBeads=TRUE,
+                              beadCutoff=0.05,
+                              filterNoCG=TRUE,
+                              filterSNPs=TRUE,
+                              population=NULL,
+                              filterMultiHit=TRUE,
+                              filterXY=TRUE,
+                              force=FALSE,
+                              arraytype="450K")
+```
+# ChAMP Quality Control 
+Check density plots for sample quality. 
+```{r message=FALSE, warning=FALSE}
+
+# 1. Quality Control files
+dir.create("./01_preprocessing/CHAMP_QCimages")
+champ.QC(beta = myloadGSE118133$beta,
+         pheno=myloadGSE118133$pd$Sample_Group,
+         mdsPlot=TRUE,
+         densityPlot=TRUE,
+         dendrogram=TRUE,
+         PDFplot=TRUE,
+         Rplot=TRUE,
+         Feature.sel="None",
+         resultsDir = "./01_preprocessing/CHAMP_QCimages/GSE118133/")
+```
+
+# ChAMP Normalisation
+Normalisation, BMIQ is used voor data as Karphathakis' data was BMIQ normalized (BMIQ best method)
+
+```{r message=FALSE, warning=FALSE}
+dir.create("./01_preprocessing/Normalisation")
+mynormGSE118133<-champ.norm(beta=myloadGSE118133$beta, rgSet=myloadGSE118133$rgSet, mset=myloadGSE118133$mset, 
+                    resultsDir = "./01_preprocessing/Normalisation/GSE118133/", 
+                    method="BMIQ", 
+                    plotBMIQ=TRUE, 
+                    arraytype="450k",
+                    cores=4)
+```
+
+# Save normalized data for later use
+
+```{r message=FALSE, warning=FALSE}
+dir.create("./01_preprocessing/PreProcessedDataSets")
+dir.create("./01_preprocessing/PreProcessedDataSets/GSE118133")
+save(myloadGSE118133, mynormGSE118133, file = './01_preprocessing/PreProcessedDataSets/GSE118133/preprocessedGSE118133.rData')
+
+```
+

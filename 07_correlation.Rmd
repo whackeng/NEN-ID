@@ -1,0 +1,138 @@
+---
+title: "07-correlation"
+author: "Wenzel Hackeng"
+date: "11/8/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+First call the required packages 
+```{r message=FALSE, warning=FALSE}
+library(pheatmap)
+library(RColorBrewer)
+library(Hmisc)
+library(ggpubr)
+library(ggsci)
+```
+
+# Load data
+```{r load data, message=FALSE, warning=FALSE}
+load('./01_preprocessing/PreProcessedDataSets/GEOMERGED/GEOMERGED.rData')
+load('./02_merge_and_peek/bestprobesMVP.rData')
+PD_combined<-read.csv("./PD_FILES/PD_combined.csv", header=TRUE)
+```
+
+```{r}
+breaksList = seq(0.7, 1, by = 0.01)
+palette2<-heat.colors(10)
+Size<-4
+```
+
+```{r}
+rCorMethylationData<-rcorr(as.matrix(merged), type="pearson") # type can be pearson or spearman
+
+CorplotHeatAll<-pheatmap(rCorMethylationData$r, cluster_rows = F,   color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(breaksList)),
+                      breaks = breaksList,
+                      cluster_cols = F, na_col = "white", border_color = NA, show_colnames = T, main
+= "Correlation\nbetween All Samples", cellwidth = Size, cellheight = Size, fontsize = Size)
+
+dir.create("07_correlation")
+save_pheatmap_pdf <- function(x, filename, width=7, height=7) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   pdf(filename, width=width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+}
+save_pheatmap_pdf(CorplotHeatAll, "./07_correlation/CorrelationHeatAll.pdf")
+
+PanNETs<-rCorMethylationData$r[20:51,20:51]
+CorplotHeatPan<-pheatmap(PanNETs, cluster_rows = T,   color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(breaksList)),
+                      breaks = breaksList,
+                      cluster_cols = T, na_col = "white", border_color = NA, show_colnames = T, main
+= "Correlation\nbetween pancreatic Samples", cellwidth = Size, cellheight = Size, fontsize = Size)
+
+save_pheatmap_pdf(CorplotHeatPan, "./07_correlation/CorrelationHeatPan.pdf")
+
+rCorMethylationData$r[lower.tri(rCorMethylationData$r)] <- NA
+
+```
+
+```{r}
+CorMatrix<-rCorMethylationData$r
+IlNET_CorMatrix<-CorMatrix[1:19,1:19]
+PanNET_CorMatrix<-CorMatrix[20:51,20:51] 
+PulNET_CorMatrix<-CorMatrix[52:69,52:69]
+
+IlNET_CorMatrix[IlNET_CorMatrix == 1] <- NA
+PanNET_CorMatrix[PanNET_CorMatrix == 1] <- NA
+PulNET_CorMatrix[PulNET_CorMatrix == 1] <- NA
+
+PulvsIl_CorMatrix<-CorMatrix[1:19,52:69]
+PanvsPul_CorMatrix<-CorMatrix[20:51,52:69]
+PanvsIl_CorMatrix<-CorMatrix[1:19,20:51]
+
+```
+
+```{r}
+Within_PanNET<-as.data.frame(as.vector(PanNET_CorMatrix))
+Within_PulmNET<-as.data.frame(as.vector(PulNET_CorMatrix))
+Within_IlealNET<-as.data.frame(as.vector(IlNET_CorMatrix))
+Between_Pan_Pul<-as.data.frame(as.vector(PanvsPul_CorMatrix))
+Between_Pan_Il<-as.data.frame(as.vector(PanvsIl_CorMatrix))
+Between_Pul_Il<-as.data.frame(as.vector(PulvsIl_CorMatrix))
+
+Within_PanNET<-as.data.frame(Within_PanNET[complete.cases(Within_PanNET), ])
+Within_PulmNET<-as.data.frame(Within_PulmNET[complete.cases(Within_PulmNET), ])
+Within_IlealNET<-as.data.frame(Within_IlealNET[complete.cases(Within_IlealNET), ])
+Between_Pan_Pul<-as.data.frame(Between_Pan_Pul[complete.cases(Between_Pan_Pul), ])
+Between_Pan_Il<-as.data.frame(Between_Pan_Il[complete.cases(Between_Pan_Il), ])
+Between_Pul_Il<-as.data.frame(Between_Pul_Il[complete.cases(Between_Pul_Il), ])
+
+Within_PanNET$comparison<-"Within_PanNET"
+colnames(Within_PanNET)<-c("CorrelationCoefficients", "Comparison")
+Within_PulmNET$comparison<-"Within_PulmNET"
+colnames(Within_PulmNET)<-c("CorrelationCoefficients", "Comparison")
+Within_IlealNET$comparison<-"Within_IlealNET"
+colnames(Within_IlealNET)<-c("CorrelationCoefficients", "Comparison")
+Between_Pan_Pul$comparison<-"Between_Pan_Pul"
+colnames(Between_Pan_Pul)<-c("CorrelationCoefficients", "Comparison")
+Between_Pan_Il$comparison<-"Between_Pan_Il"
+colnames(Between_Pan_Il)<-c("CorrelationCoefficients", "Comparison")
+Between_Pul_Il$comparison<-"Between_Pul_Il"
+colnames(Between_Pul_Il)<-c("CorrelationCoefficients", "Comparison")
+
+CorrelationDataframe<-rbind(Within_PanNET,Within_PulmNET,Within_IlealNET,Between_Pan_Pul,Between_Pan_Il,Between_Pul_Il)
+
+ggboxplot(CorrelationDataframe, x = "Comparison", y = "CorrelationCoefficients",
+          color = "Comparison", add = "jitter")+
+  theme(
+    panel.border = element_blank(),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    legend.key=element_blank(),
+    legend.background=element_blank(),
+    axis.text.x = element_text(angle = 90, hjust = 1)
+  )+
+  scale_x_discrete(breaks=c("Within_PanNET", "Within_PulmNET", "Within_IlealNET",
+                            "Between_Pan_Pul", "Between_Pan_Il", "Between_Pul_Il"),
+                   labels=c("Within Pancreas", "Within Lung", "Within Ileum",
+                            "Between\nPancreas and Lung", "Between\nPancreas and Ileum", "Between\nLung and Ileum"))+
+  scale_fill_npg(guide=FALSE)+
+  scale_color_npg(guide=FALSE)+
+  labs(y = "Correlation Coefficients", x= "")
+
+dir.create("07_correlation")
+ggsave("Correlation.eps", path = "./07_correlation/", width = 6,
+  height = 5,
+  units = "in")
+
+
+```
+

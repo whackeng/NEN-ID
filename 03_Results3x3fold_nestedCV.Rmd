@@ -1,0 +1,317 @@
+---
+title: "03-Results3x3fold-nestedCV"
+author: "Wenzel Hackeng"
+date: "22/10/2020"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+First call the required packages 
+```{r message=FALSE, warning=FALSE}
+library('dplyr')
+library('tidyr')
+library('ggplot2')
+library('cowplot')
+```
+
+# Load data
+```{r message=FALSE, warning=FALSE}
+load("./03_nestedCV/nestedCVREPsseed11rep3tr500llambda.1sea0nf32020-10-22.rData")
+```
+
+# Settings of the run above
+```{r message=FALSE, warning=FALSE}
+# general choices
+Seed<-11 # for repeatability
+repeats<-3 # repeats of the whole proces of, split, CV and nested CV
+# Random forest indicators
+Trees<-500
+# Ridge Regression indicators
+Lambda<-"lambda.1se" # or lambda.min
+Alpha <- 0 # 0 = Ridge regression, 1 = Lasso
+Nfolds <- 3 #fold nested CV
+```
+
+# Results for Accuracy
+Boxplot for accuracy based on 9 values per group (3 fold CV with 3 repeats). 
+Of note, multiclass ROC sometimes gives an AUC of 1, even though the accuracy is <1. This is because multiclass ROC as defined by Hand and Till compared 1-vs-1 class instead of 1-vs-the rest. 
+```{r message=FALSE, warning=FALSE}
+# Results
+results <- matrix(nrow=3*repeats, ncol=21)
+results[,1]<-rep(1:repeats, rep=repeats, each=3)
+results[,2]<-Seed
+results[,3]<-Trees
+results[,4]<-Lambda
+results[,5]<-Alpha
+results[,6]<-Nfolds
+
+for (r in 1:repeats)
+  for (i in 1:3){
+  results[((r-1)*3+i),7]<-1-REPs[[r]][[i]][["RF"]][["OOBerror"]]
+  results[((r-1)*3+i),8]<-REPs[[r]][[i]][["predictRFtest"]][["Accuracy"]]
+  results[((r-1)*3+i),9]<-REPs[[r]][[i]][["predictLRtest"]][["Accuracy"]]
+  results[((r-1)*3+i),10]<-REPs[[r]][[i]][["predictRFumcuval"]][["Accuracy"]]
+  results[((r-1)*3+i),11]<-REPs[[r]][[i]][["predictLRumcuval"]][["Accuracy"]]
+  results[((r-1)*3+i),12]<-REPs[[r]][[i]][["RFtrainROC"]][["auc"]]
+  results[((r-1)*3+i),13]<-REPs[[r]][[i]][["predictRFtestROC"]][["auc"]]
+  results[((r-1)*3+i),14]<-REPs[[r]][[i]][["predictLRtestROC"]][["auc"]]
+  results[((r-1)*3+i),15]<-REPs[[r]][[i]][["predictRFumcuvalROC"]][["auc"]]
+  results[((r-1)*3+i),16]<-REPs[[r]][[i]][["predictLRumcuvalROC"]][["auc"]]
+  results[((r-1)*3+i),17]<-REPs[[r]][[i]][["RFtrainlogloss"]]
+  results[((r-1)*3+i),18]<-REPs[[r]][[i]][["predictRFtestlogloss"]]
+  results[((r-1)*3+i),19]<-REPs[[r]][[i]][["predictLRtestlogloss"]]
+  results[((r-1)*3+i),20]<-REPs[[r]][[i]][["predictRFumcuvallogloss"]]
+  results[((r-1)*3+i),21]<-REPs[[r]][[i]][["predictLRumcuvallogloss"]]
+}
+
+results<-as.data.frame(results)
+colnames(results)<-c("Repeats", "Seed","RFtrees", "Lambda", 
+                     "Alpha", "Nfolds", "Train_OOB_RFaccuracy", "Test_RFaccuracy", "Test_LRaccuracy", "UMCUval_RFaccuracy", "UMCUval_LRaccuracy", "TrainRFAUC", "Test_RFAUC", "Test_LRAUC", "UMCUval_RFAUC", "UMCUval_LRAUC", "TrainRFlogloss", "Test_RFlogloss", "Test_LRlogloss", "UMCUval_RFlogloss", "UMCUval_LRlogloss")
+
+
+
+newdir<-"03_nestedCV"
+ifelse(!dir.exists(file.path(getwd(), newdir)), dir.create(file.path(getwd(), newdir)), FALSE)
+myfile <- file.path(paste0("./03_nestedCV/nestedCVresults","seed",Seed,"rep",repeats,"tr",Trees,"l",Lambda,"a",Alpha,"nf",Nfolds,".rData"))
+save(results, file = myfile)
+
+#make long data
+longresultsaccuracy<-gather(results, Groups, Accuracy, Train_OOB_RFaccuracy, Test_RFaccuracy, Test_LRaccuracy, UMCUval_RFaccuracy, UMCUval_LRaccuracy, factor_key=TRUE)
+longresultsaccuracy$Accuracy<-as.numeric(longresultsaccuracy$Accuracy)
+longresultsaccuracy$Accuracy<-longresultsaccuracy$Accuracy*100
+
+longresultsAUC<-gather(results, Groups, AUC, TrainRFAUC, Test_RFAUC, Test_LRAUC, UMCUval_RFAUC, UMCUval_LRAUC, factor_key=TRUE)
+longresultsAUC$AUC<-as.numeric(longresultsAUC$AUC)
+longresultsAUC$AUC<-longresultsAUC$AUC/100
+
+longresultslogloss<-gather(results, Groups, LogLoss, TrainRFlogloss, Test_RFlogloss, Test_LRlogloss, UMCUval_RFlogloss, UMCUval_LRlogloss, factor_key=TRUE)
+longresultslogloss$LogLoss<-as.numeric(longresultslogloss$LogLoss)
+
+
+# Visualize with ggplot
+lines <- "black"
+plot1<-ggplot(longresultsaccuracy, aes(x = Groups, y = Accuracy, fill=Groups))+
+geom_boxplot(colour = lines, outlier.color = "black")+
+scale_fill_manual(values=c("#999999", "#4DBBD5B2", "#00A087B2","#4DBBD5B2", "#00A087B2"))+
+scale_color_manual(values=c("#999999", "#4DBBD5B2", "#00A087B2","#4DBBD5B2", "#00A087B2"))+
+  theme(
+    legend.position = "none",
+    panel.border = element_blank(),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    legend.key=element_blank(),
+    legend.background=element_blank(),
+    text=element_text(size=16),
+    axis.title.x=element_blank(),
+    axis.text.x=element_blank())+
+    xlab("Model Groups")+
+    ylab("Accuracy")
+
+plot2<-ggplot(longresultsAUC, aes(x = Groups, y = AUC, fill=Groups))+
+geom_boxplot(colour = lines, outlier.color = "black")+
+scale_fill_manual(values=c("#999999", "#4DBBD5B2", "#00A087B2","#4DBBD5B2", "#00A087B2"))+
+scale_color_manual(values=c("#999999", "#4DBBD5B2", "#00A087B2","#4DBBD5B2", "#00A087B2"))+
+  theme(
+    legend.position = "none",
+    panel.border = element_blank(),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    legend.key=element_blank(),
+    legend.background=element_blank(),
+    text=element_text(size=16),
+    axis.title.x=element_blank(),
+    axis.text.x=element_blank())+
+    xlab("Model Groups")+
+    ylab("AUC")
+
+plot3<-ggplot(longresultslogloss, aes(x = Groups, y = LogLoss, fill=Groups))+
+geom_boxplot(colour = lines, outlier.color = "black")+
+scale_fill_manual(values=c("#999999", "#4DBBD5B2", "#00A087B2","#4DBBD5B2", "#00A087B2"))+
+scale_color_manual(values=c("#999999", "#4DBBD5B2", "#00A087B2","#4DBBD5B2", "#00A087B2"))+
+scale_y_continuous(labels=function(x){sprintf("%.3f", x)})+
+  theme(
+    legend.position = "none",
+    panel.border = element_blank(),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    legend.key=element_blank(),
+    legend.background=element_blank(),
+    text=element_text(size=16),
+    axis.text.x = element_text(face="bold", color="black", size=10, angle=45, hjust=1))+
+    scale_x_discrete(labels=c("TrainRF\nOOB AUC" = "Internal\nTrain Error", "Test_RFAUC" = "RF\nTestset", "Test_LRAUC" = "RF+RR\nTestset", "UMCUval_RFAUC"= "RF\nUMCUset", "UMCUval_LRAUC" = "RF+RR\nUMCUset"))+
+    xlab("Model Groups")+
+    ylab("Log Loss")
+
+```
+
+# Plot of results
+
+```{r echo=FALSE, fig.height = 5, fig.width = 6, fig.align = "center"}
+plot_grid(plot1, plot2, plot3, align = "v", nrow = 3, rel_heights = c(1/6, 1/6, 1/2.75))
+```
+
+
+# Summary of results
+```{r message=FALSE, warning=FALSE}
+results[,c(7:21)]<-apply(results[,c(7:21)], 2, as.numeric)
+summary(results[,c(7:21)])
+
+```
+
+
+
+# Summary of prediction scores in combined test cohorts
+```{r}
+predRFlist<-list()
+for (r in 1:3){
+  for (f in 1:3){
+    tempdf<-as.data.frame(REPs[[r]][[f]][[7]][[3]])
+    colnames(tempdf)<-c(paste("IlealNET",(r-1)*3+f),paste("PanNET",(r-1)*3+f),paste("PulmNET",(r-1)*3+f))
+    predRFlist[[((r-1)*3)+f]]<-tempdf
+  }}
+
+predLRlist<-list()
+for (r in 1:3){
+  for (f in 1:3){
+    tempdf<-as.data.frame(REPs[[r]][[f]][[8]][[3]])
+    colnames(tempdf)<-c(paste("IlealNET",(r-1)*3+f),paste("PanNET",(r-1)*3+f),paste("PulmNET",(r-1)*3+f))
+    predLRlist[[((r-1)*3)+f]]<-tempdf
+    }}
+
+predRFlist_full<-merge(predRFlist[[1]], predRFlist[[2]], by.x = "row.names", by.y = "row.names", all = TRUE)
+predRFlist_full<-merge(predRFlist_full, predRFlist[[3]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predRFlist_full<-merge(predRFlist_full, predRFlist[[4]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predRFlist_full<-merge(predRFlist_full, predRFlist[[5]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predRFlist_full<-merge(predRFlist_full, predRFlist[[6]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predRFlist_full<-merge(predRFlist_full, predRFlist[[7]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predRFlist_full<-merge(predRFlist_full, predRFlist[[8]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predRFlist_full<-merge(predRFlist_full, predRFlist[[9]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+
+predLRlist_full<-merge(predLRlist[[1]], predLRlist[[2]], by.x = "row.names", by.y = "row.names", all = TRUE)
+predLRlist_full<-merge(predLRlist_full, predLRlist[[3]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predLRlist_full<-merge(predLRlist_full, predLRlist[[4]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predLRlist_full<-merge(predLRlist_full, predLRlist[[5]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predLRlist_full<-merge(predLRlist_full, predLRlist[[6]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predLRlist_full<-merge(predLRlist_full, predLRlist[[7]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predLRlist_full<-merge(predLRlist_full, predLRlist[[8]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+predLRlist_full<-merge(predLRlist_full, predLRlist[[9]], by.x = "Row.names", by.y = "row.names", all = TRUE)
+
+PD_combined<-read.csv("./PD_FILES/PD_combined.csv", header=TRUE)
+predRFlist_full<-merge(PD_combined[,c("Sample_Name", "Sample_Group")], predRFlist_full,  by.x = "Sample_Name", by.y = "Row.names")
+predLRlist_full<-merge(PD_combined[,c("Sample_Name", "Sample_Group")], predLRlist_full,  by.x = "Sample_Name", by.y = "Row.names")
+
+
+predRFlist_pan<-subset(predRFlist_full, Sample_Group == "PanNET")
+predRFlist_pan<-select(predRFlist_pan, matches("PanNET|Sample"))
+row.names(predRFlist_pan)<-predRFlist_pan[,1]
+predRFlist_pan[,1:2]<-NULL
+
+predLRlist_pan<-subset(predLRlist_full, Sample_Group == "PanNET")
+predLRlist_pan<-select(predLRlist_pan, matches("PanNET|Sample"))
+row.names(predLRlist_pan)<-predLRlist_pan[,1]
+predLRlist_pan[,1:2]<-NULL
+
+
+predRFlist_pulm<-subset(predRFlist_full, Sample_Group == "PulmNET")
+predRFlist_pulm<-select(predRFlist_pulm, matches("PulmNET|Sample"))
+row.names(predRFlist_pulm)<-predRFlist_pulm[,1]
+predRFlist_pulm[,1:2]<-NULL
+
+predLRlist_pulm<-subset(predLRlist_full, Sample_Group == "PulmNET")
+predLRlist_pulm<-select(predLRlist_pulm, matches("PulmNET|Sample"))
+row.names(predLRlist_pulm)<-predLRlist_pulm[,1]
+predLRlist_pulm[,1:2]<-NULL
+
+
+predRFlist_il<-subset(predRFlist_full, Sample_Group == "IlealNET")
+predRFlist_il<-select(predRFlist_il, matches("IlealNET|Sample"))
+row.names(predRFlist_il)<-predRFlist_il[,1]
+predRFlist_il[,1:2]<-NULL
+
+predLRlist_il<-subset(predLRlist_full, Sample_Group == "IlealNET")
+predLRlist_il<-select(predLRlist_il, matches("IlealNET|Sample"))
+row.names(predLRlist_il)<-predLRlist_il[,1]
+predLRlist_il[,1:2]<-NULL
+
+predsummary <- matrix(nrow=6, ncol=7)
+
+predsummary[1,1:6]<-summary(as.vector(as.matrix(predRFlist_il)))[1:6]
+predsummary[1,7]<-sd(as.vector(as.matrix(predRFlist_il)), na.rm = TRUE)
+predsummary[2,1:6]<-summary(as.vector(as.matrix(predRFlist_pan)))[1:6]
+predsummary[2,7]<-sd(as.vector(as.matrix(predRFlist_pan)), na.rm = TRUE)
+predsummary[3,1:6]<-summary(as.vector(as.matrix(predRFlist_pulm)))[1:6]
+predsummary[3,7]<-sd(as.vector(as.matrix(predRFlist_pulm)), na.rm = TRUE)
+
+predsummary[4,1:6]<-summary(as.vector(as.matrix(predLRlist_il)))[1:6]
+predsummary[4,7]<-sd(as.vector(as.matrix(predLRlist_il)), na.rm = TRUE)
+predsummary[5,1:6]<-summary(as.vector(as.matrix(predLRlist_pan)))[1:6]
+predsummary[5,7]<-sd(as.vector(as.matrix(predLRlist_pan)), na.rm = TRUE)
+predsummary[6,1:6]<-summary(as.vector(as.matrix(predLRlist_pulm)))[1:6]
+predsummary[6,7]<-sd(as.vector(as.matrix(predLRlist_pulm)), na.rm = TRUE)
+
+predsummary<-as.data.frame(predsummary, sort = FALSE)
+row.names(predsummary)<-c("ileal RF","pancreatic RF","lung RF", "ileal LR","pancreatic LR","lung LR")
+colnames(predsummary)<-c("Min.","1st Qu.","Median", "Mean","3rd Qu.","Max.", "SDev")
+predsummary
+
+myfile <- file.path(paste0("./03_nestedCV/predsummaryCV",".rData"))
+save(predsummary, file = myfile)
+
+
+df_il<-cbind(as.data.frame(na.omit(as.vector(as.matrix(predRFlist_il)))),as.data.frame(na.omit(as.vector(as.matrix(predLRlist_il)))))
+df_pan<-cbind(as.data.frame(na.omit(as.vector(as.matrix(predRFlist_pan)))),as.data.frame(na.omit(as.vector(as.matrix(predLRlist_pan)))))
+df_pulm<-cbind(as.data.frame(na.omit(as.vector(as.matrix(predRFlist_pulm)))),as.data.frame(na.omit(as.vector(as.matrix(predLRlist_pulm)))))
+
+
+
+plot1<-ggplot(df_il, aes(x=df_il[,1], fill="red")) + 
+  geom_density(alpha=0.5)+
+  geom_density(data=df_il, aes(x=df_il[,2], fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Ileal Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                        breaks = c("red", "blue"),
+                        labels = c("Raw RF", "Calibrated RF"),
+                        guide = "legend")+
+  theme_classic()
+  
+plot2<-ggplot(df_pan, aes(x=df_pan[,1], fill="red")) + 
+  geom_density(alpha=0.5)+
+  geom_density(data=df_pan, aes(x=df_pan[,2], fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Pancreatic Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                      breaks = c("red", "blue"),
+                      labels = c("Raw RF", "Calibrated RF"),
+                      guide = "legend")+
+  theme_classic()
+
+plot3<-ggplot(df_pulm, aes(x=df_pulm[,1], fill="red")) + 
+  geom_density(alpha=0.5)+
+  geom_density(data=df_pulm, aes(x=df_pulm[,2], fill="blue"), alpha=0.5)+
+  xlim(0,1)+
+  labs(x="Class score", y= "Density", title = "Lung Class", fill = "Model")+
+  scale_fill_identity(name = "Model fit",
+                      breaks = c("red", "blue"),
+                      labels = c("Raw RF", "Calibrated RF"),
+                      guide = "legend")+
+  theme_classic()
+ 
+
+plot_grid(plot1, plot2, plot3, align = "v", nrow = 3, rel_heights = c(1/3, 1/3, 1/3))
+
+ggsave("classscorespredictiveCV.pdf", path = "./03_nestedCV/", width = 6,
+       height = 4,
+       units = "in")
+```
+

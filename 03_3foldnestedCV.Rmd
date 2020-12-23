@@ -1,0 +1,351 @@
+---
+title: "03-3x3fold-nestedCV"
+author: "Wenzel Hackeng"
+date: "22/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+First call the required packages 
+```{r message=FALSE, warning=FALSE}
+library('caret')
+library('splitstackshape')
+library('matrixStats')
+library('randomForest')
+library('glmnet')
+library('ModelMetrics')
+library('pROC')
+library('readr')
+```
+
+# Functions for analyses
+```{r message=FALSE, warning=FALSE}
+# FUNCTION three fold split function with stratification for sample groups, returns list of CV sets with trainval and testset, requires splitstackshape
+threefoldsplit<-function(df, strat="Sample_Group"){
+  # stratified split 
+  L1 <- stratified(df, strat, size = 1/3, replace = FALSE, bothSets = TRUE, keep.rownames = TRUE)
+  L2 <- stratified(L1[[2]], strat, size = 1/2, replace = FALSE, bothSets = TRUE, keep.rownames = TRUE)
+  FL<-list()
+  f1<-as.data.frame(L1[[1]])
+  f1[1:3,1:3]
+  rownames(f1)<-f1[,1]
+  f1[,1]<-NULL
+  FL[[1]]<-f1
+  f2<-as.data.frame(L2[[1]])
+  rownames(f2)<-f2[,1]
+  f2[,1]<-NULL
+  FL[[2]]<-f2
+  f3<-as.data.frame(L2[[2]])
+  rownames(f3)<-f3[,1]
+  f3[,1]<-NULL
+  FL[[3]]<-f3
+  # make trainval and test sets 
+  CV1<-list(trainval=rbind(FL[[1]],FL[[2]]), test = FL[[3]])
+    cat("CV1\n")
+    cat("TrainVal")
+    print(table(CV1$trainval$Sample_Group))
+    cat("Test")
+    print(table(CV1$test$Sample_Group))
+  CV2<-list(trainval=rbind(FL[[2]],FL[[3]]), test = FL[[1]])
+    cat("CV2\n")
+    cat("TrainVal")
+    print(table(CV2$trainval$Sample_Group))
+    cat("Test")
+    print(table(CV2$test$Sample_Group))
+  CV3<-list(trainval=rbind(FL[[1]],FL[[3]]), test = FL[[2]])
+    cat("CV3\n")
+    cat("TrainVal")
+    print(table(CV3$trainval$Sample_Group))
+    cat("Test")
+    print(table(CV3$test$Sample_Group))
+  CVL<-list(CV1,CV2,CV3)
+return(CVL)
+}
+
+
+# FUNCTION determine most variable positions by downsampling with 3 repeats, function requires MatrixStats and caret
+DownSampMVP<-function(df){
+  downsampnames<-list()
+  # three random downsamples on only groups and sample names for speed.
+  df$RowNames<-rownames(df)
+  for(i in 1:3){
+      downsampnames[[i]]<-downSample(df[,"RowNames"],df[,"Sample_Group"], list=FALSE)
+  }
+
+  # lapply merge with beta values, remove first two columns (names and class), and transpose. Sample names are     not relevant as searching for the most variable positions. 
+  downsamples<-lapply(downsampnames,function(x,y){merge(x, y, by.x=names(x)[1], by.y="RowNames")},df[,!names(df) %in% c("Sample_Group")])
+  downsamples<-lapply(downsamples, "[", -c(1, 2))
+  downsamples<-lapply(downsamples,function(x){t(x)})
+
+  # inefficient way of ordering probes by mean absolute standard deviation
+  a<-downsamples[[1]]
+  b<-downsamples[[2]]
+  c<-downsamples[[3]]
+  amads=apply(a,1,mad)
+  bmads=apply(b,1,mad)
+  cmads=apply(c,1,mad)
+  amergedmad<-as.data.frame(a[rev(order(amads)),])
+  bmergedmad<-as.data.frame(b[rev(order(bmads)),])
+  cmergedmad<-as.data.frame(c[rev(order(cmads)),])
+  amergedmad$ordera<-1:nrow(amergedmad)
+  bmergedmad$orderb<-1:nrow(bmergedmad)
+  cmergedmad$orderc<-1:nrow(cmergedmad)
+
+  # selecting probes by the minimal rank of the mean absolute standard deviation over all downsamples. 
+  MVprobes<-merge(amergedmad, bmergedmad, by.x= "row.names", by.y= "row.names")
+  MVprobes<-merge(MVprobes, cmergedmad, by.x= "Row.names", by.y= "row.names")
+  rownames(MVprobes) <- MVprobes[,1]
+  MVprobes[,1] <-NULL
+  MVprobes<-MVprobes[,c("ordera","orderb","orderc")]
+  MVprobes$min <- rowMins(as.matrix(MVprobes))
+  MVprobes$max <- rowMaxs(as.matrix(MVprobes))
+  MVprobes <-MVprobes[order(MVprobes$max, decreasing = FALSE),]
+  bestprobesMVP<-MVprobes[1:5000,c("min", "max")]
+  return(bestprobesMVP)
+}
+
+# Functions to add annotation data to MVP and Test and change to trainvalMVPs to numeric
+prepMVP<-function(df){
+  dfx<-as.data.frame(t(df))
+  dfx[]<-lapply(dfx, function(x) as.numeric(as.character(x)))
+  MVPdata<- merge(pd, dfx, by.x="Sample_Name", by.y = "row.names", sort = FALSE)
+  rownames(MVPdata)<-MVPdata[,1]
+  MVPdata[,1]<-NULL
+  return(MVPdata)
+}
+
+# Function for Random forest with with downsampling for number of group cases
+RFdownsamp<-function(x){ # x = trainval set
+  temp<-summary(x[["Sample_Group"]])
+  Smallesttemp<-min(temp)
+  Groupstemp<-length(temp)
+  MVPmodeltemp<-randomForest(Sample_Group~.,data=x, ntree=Trees, mtry = sqrt(ncol(x)-1), importance=TRUE, sampsize=rep(Smallesttemp, Groupstemp)) 
+  oob<-tail(MVPmodeltemp$err.rate[,1], n=1)
+  return(list(RFmodel=MVPmodeltemp, OOBerror=oob))
+}
+
+# Function nested CV lambda 1se
+nestCVlambda<-function(x){ # x= trainval set
+  model<-x # input RF model
+  votes<-model$votes # get raw scores for fit_score file
+  origin<-as.data.frame(model$y)
+  colnames(origin)[1] <- "Origin"
+  fit_score<-merge(votes, origin, by.x = "row.names", by.y = "row.names")
+  row.names(fit_score)<-fit_score[,1]
+  fit_score[,1]<-NULL
+  # make matrix 
+  x <- model.matrix(Origin~., fit_score)[,-1]
+  # Convert the outcome (class) to a numerical variable
+  y <- as.factor(fit_score$Origin)
+  # try different lambda ridge penalties in 3fold cross validation
+  cv <- cv.glmnet(x, y, family = "multinomial", alpha = Alpha, nfolds = Nfolds)
+  # L2 ridge regression regression model with best lambda
+  L2reg_model <- glmnet(x, y, family = "multinomial",  alpha = Alpha, lambda = cv[[Lambda]])
+  return(list(Ridgemodel=L2reg_model, Lmin = cv$lambda.min, L1se = cv$lambda.1se))
+}
+
+
+# function to test RF in Testfold
+TestRFprediction<-function(x, y, z) { # x = RFmodel, y = new data, z = true sample group
+  TestRFprediction<-predict(x, y, type = 'response')
+  TestRFvotes<-predict(x, y, type = 'vote')
+  OutputResponse<-(table(TestRFprediction, actual = z))
+  Accuracy <- sum(diag(OutputResponse))/sum(OutputResponse)
+  return(list(Table = OutputResponse, Accuracy = Accuracy, Votes = TestRFvotes, Prediction = TestRFprediction))
+}
+
+# function to test LR model in Testfold
+TestLRprediction<-function(x, y, z, S){ # x = LRmodel, y = RF votes of new data, z = true sample group, S = lambda
+  TestLRprediction<-predict(x, newx = y, s = S, type = "class")
+  TestLRprob<-predict(x, newx = y, s = S, type = "response")
+  OutputResponse<-(table(TestLRprediction, actual = z))
+  Accuracy <- sum(diag(OutputResponse))/sum(OutputResponse)
+  return(list(Table = OutputResponse, Accuracy = Accuracy, Prob = TestLRprob, Prediction = TestLRprediction))
+}
+
+# Function impute beta values
+impute_random <- function(mat){
+  stopifnot(is.matrix(mat))
+  
+  if (all(is.na(mat))) {
+    warning("No non-NA data points, returning object unchanged")
+    na_num <- nrow(mat)
+    return(list(imputed = mat, n = na_num))
+  } else {
+    na_pos <- is.na(mat)
+    na_num <- sum(na_pos)
+    mat[na_pos] <- sample(x = mat[!na_pos], size = na_num, replace = TRUE)
+    return(list(imputed = mat, n = na_num))
+  }
+}
+
+```
+
+# Load data
+```{r load data, message=FALSE, warning=FALSE}
+load('./01_preprocessing/PreProcessedDataSets/GEOMERGED/GEOMERGED.rData')
+load('./01_preprocessing/PreProcessedDataSets/UMCU/preprocessedUMCU.rData')
+load('./02_merge_and_peek/bestprobesMVP.rData')
+EPIC_probes<-read_csv("./RAW/infinium-methylationepic-v-1-0-b5-manifest-file.csv", col_types = cols(Coordinate_36 = col_character()), 
+    skip = 7)[,c(1,2)]
+PD_combined<-read.csv("./PD_FILES/PD_combined.csv", header=TRUE)
+```
+
+# Prepare data 
+General preparing of data for further analysis. 
+```{r prep data, message=FALSE, warning=FALSE}
+
+EPIC_probes[,1]<-"x" 
+# merge 450k training cohort data and EPIC manifest probes to select overlapping probes
+GEO_overlap<-merge(EPIC_probes, merged, by.x="Name", by.y="row.names")
+rownames(GEO_overlap) <- GEO_overlap[,1]
+GEO_overlap_probes <- GEO_overlap[,1:2]
+GEO_overlap[,1:2] <- NULL
+
+
+# prepare betavalues UMCU cohort. Deselecting cases of unknown primary and randomly imputing missing probes that are present in the training data
+UMCU_selection<-as.data.frame(mynormUMCU[, names(as.data.frame(mynormUMCU)) %in% 
+c("1LCasePan","2LCasePan","3LCasePan","5MCasePan",
+"6M2CasePan","4InCasePan","Ileum_met_spor_NET","Ileum_prim_spor_NET","Lung_NEN_sporadic1","Lung_NEN_sporadic2", "prim-met5In", "prim-met6M1",         "prim-met6In", "Lung_NEN_sporadic3", "Lung_NEN_sporadic4",  "Lung_NEN_sporadic5", "Lung_NEN_sporadic6", "Lung_met_NEN_sporadic1",
+"Lung_NEN_sporadic7", "Lung_NEN_sporadic8", "Lung_NEN_sporadic9",    
+"Ileum_met_spor_NET2",    "Ileum_met_spor_NET3"), drop = F])
+UMCU_selection<-merge(GEO_overlap_probes, UMCU_selection, by.x="Name", by.y="row.names", all=TRUE)
+rownames(UMCU_selection) <- UMCU_selection[,1]
+UMCU_selection[,1:2] <- NULL
+UMCU_selection_prepped<-as.data.frame(impute_random(as.matrix(UMCU_selection))[[1]])
+
+# prepare sample group data training cohort 
+PD_GEO_overlap<-subset(PD_combined[1:69,])
+PD_GEO_overlap$Sample_Group<-as.factor(as.character(PD_GEO_overlap$Sample_Group))
+
+# prepare sample group data UMCU test cohort
+PD_UMCU_selection_prepped<-subset(PD_combined[70:95,], Sample_Name != "Lung_NEN_MEN1" & Sample_Name !="NET-UP" & Sample_Name !="NET-UP2")
+PD_UMCU_selection_prepped$Sample_Group<-as.factor(as.character(PD_UMCU_selection_prepped$Sample_Group))
+
+```
+
+# 3x3 nested cross validation 
+RF model based on most variable positions as determined by the downsampled mean absolute standard deviation, nested crossvalidation to build ridge regression calibration. Macbook pro 2.9 GHz Dual-Core Intel Core i5
+```{r sys time}
+Sys.time()
+```
+
+```{r 3x3 cv, message=FALSE, warning=FALSE}
+# general input
+input<-GEO_overlap # the input dataframe with beta values
+pd<-PD_GEO_overlap[,c("Sample_Name","Sample_Group")]
+inputval<-UMCU_selection_prepped # the input additional test dataframe with beta values
+pdval<-PD_UMCU_selection_prepped[,c("Sample_Name","Sample_Group")]
+
+
+# general method choices
+Seed<-11 # for repeatability
+repeats<-3 # repeats of the whole proces of, split, CV and nested CV
+# Random forest indicators
+Trees<-500
+# Ridge Regression indicators
+Lambda<-"lambda.1se" # or lambda.min
+Alpha <- 0 # 0 = Ridge regression, 1 = Lasso
+Nfolds <- 3 #fold nested CV
+
+# merge with annotations GEO
+annoinput<-merge(t(input), pd, by.x="row.names", by.y="Sample_Name")
+rownames(annoinput)<-annoinput[,1]
+annoinput[,1]<-NULL
+
+# merge with annotations UMCU + reorder factor for accuraccy calculations
+annoinputval<-merge(pdval,t(inputval), by.x="Sample_Name", by.y="row.names")
+rownames(annoinputval)<-annoinputval[,1]
+annoinputval[,1]<-NULL
+annoinputval[,1] = factor(annoinputval[,1],levels(annoinputval[,1])[c(1,3,2)])
+
+# create list to fill
+REPs<-list()
+set.seed(Seed)
+
+for (r in 1:repeats){
+  REPs[[r]]<-threefoldsplit(annoinput)
+}
+
+for (r in 1:repeats){
+  for(i in 1:3){
+  # get MVPs for all training sets #9minutes
+  REPs[[r]][[i]][["MVPs"]]<-DownSampMVP(REPs[[r]][[i]][["trainval"]])
+  
+  # merge MVPs with trainingsets
+  REPs[[r]][[i]][["MVPsTrain"]]<-merge(REPs[[r]][[i]][["MVPs"]], t(REPs[[r]][[i]][["trainval"]]), by.x= "row.names", by.y= "row.names")
+  rownames(REPs[[r]][[i]][["MVPsTrain"]]) <- REPs[[r]][[i]][["MVPsTrain"]][,1]
+  REPs[[r]][[i]][["MVPsTrain"]][,1:3] <-NULL
+  REPs[[r]][[i]][["MVPsTrain"]]<-prepMVP(REPs[[r]][[i]][["MVPsTrain"]])
+  
+   # build random forest model on trainval set
+  REPs[[r]][[i]][["RF"]]<-RFdownsamp(REPs[[r]][[i]][["MVPsTrain"]])
+
+  # build ridge logistic regression on raw random forest scores with 3 fold lambda optimization
+  REPs[[r]][[i]][["LR"]]<-nestCVlambda(REPs[[r]][[i]][["RF"]][["RFmodel"]])
+  
+  # predict origin in test fold with random forest model (raw scores and class)
+  REPs[[r]][[i]][["predictRFtest"]]<-TestRFprediction(REPs[[r]][[i]][["RF"]][["RFmodel"]],REPs[[r]][[i]][["test"]][,1:ncol(REPs[[r]][[i]][["test"]]-1)],REPs[[r]][[i]][["test"]][,"Sample_Group"])
+  
+  # predict origin in test fold with logistic regression model (probabilities and class)
+  REPs[[r]][[i]][["predictLRtest"]]<-TestLRprediction(REPs[[r]][[i]][["LR"]][["Ridgemodel"]],REPs[[r]][[i]][["predictRFtest"]][["Votes"]],REPs[[r]][[i]][["test"]][,"Sample_Group"],REPs[[r]][[i]][["LR"]][["Ridgemodel"]][[6]])
+  
+  # predict origin in UMCU Validation with random forest model (raw scores and class)
+  REPs[[r]][[i]][["predictRFumcuval"]]<-TestRFprediction(REPs[[r]][[i]][["RF"]][["RFmodel"]],annoinputval[,2:ncol(annoinputval)],annoinputval[,"Sample_Group"])
+  
+  # predict origin in UMCU Validation with logistic regression model (probabilities and class)
+  REPs[[r]][[i]][["predictLRumcuval"]]<-TestLRprediction(REPs[[r]][[i]][["LR"]][["Ridgemodel"]],REPs[[r]][[i]][["predictRFumcuval"]][["Votes"]],annoinputval[,1],REPs[[r]][[i]][["LR"]][["Ridgemodel"]][[6]])
+  
+  #Calculate ROC curves RF train
+  REPs[[r]][[i]][["RFtrainROC"]]<-multiclass.roc(REPs[[r]][[i]][["RF"]][["RFmodel"]][["y"]], REPs[[r]][[i]][["RF"]][["RFmodel"]][["votes"]], percent = TRUE, plot = FALSE)
+  
+  #Calculate ROC curves RF test
+  REPs[[r]][[i]][["predictRFtestROC"]]<-multiclass.roc(REPs[[r]][[i]][["test"]][,"Sample_Group"], REPs[[r]][[i]][["predictRFtest"]][["Votes"]], percent = TRUE, plot = FALSE)
+
+  #Calculate ROC curves LR test (first convert prob to df compatible with .roc)
+  REPs[[r]][[i]][["predictLRtest"]][["Prob_for_ROC"]]<-as.data.frame(REPs[[r]][[i]][["predictLRtest"]][["Prob"]])
+  colnames(REPs[[r]][[i]][["predictLRtest"]][["Prob_for_ROC"]])<- c("IlealNET", "PanNET", "PulmNET")
+  REPs[[r]][[i]][["predictLRtestROC"]]<-multiclass.roc(REPs[[r]][[i]][["test"]][,"Sample_Group"], as.data.frame(REPs[[r]][[i]][["predictLRtest"]][["Prob_for_ROC"]]), percent = TRUE, plot = FALSE)
+
+  # Calculate ROC curves RF UMCU 
+  REPs[[r]][[i]][["predictRFumcuval"]][["Votes_for_ROC"]]<-as.data.frame(REPs[[r]][[i]][["predictRFumcuval"]][["Votes"]])
+  colnames(REPs[[r]][[i]][["predictRFumcuval"]][["Votes_for_ROC"]])<- c("CaseIleum", "CasePan", "CaseLung")
+  REPs[[r]][[i]][["predictRFumcuvalROC"]]<-multiclass.roc(annoinputval[,1], REPs[[r]][[i]][["predictRFumcuval"]][["Votes_for_ROC"]], percent = TRUE, plot = FALSE)
+
+  #Calculate ROC curves LR UMCU (first convert prob to df compatible with .roc)
+  REPs[[r]][[i]][["predictLRumcuval"]][["Prob_for_ROC"]]<-as.data.frame(REPs[[r]][[i]][["predictLRumcuval"]][["Prob"]])
+  colnames(REPs[[r]][[i]][["predictLRumcuval"]][["Prob_for_ROC"]])<- c("CaseIleum", "CasePan", "CaseLung")
+  REPs[[r]][[i]][["predictLRumcuvalROC"]]<-multiclass.roc(annoinputval[,1], REPs[[r]][[i]][["predictLRumcuval"]][["Prob_for_ROC"]], percent = TRUE, plot = FALSE)
+
+    #Calculate log-loss  RF train
+  REPs[[r]][[i]][["RFtrainlogloss"]]<-mlogLoss(REPs[[r]][[i]][["RF"]][["RFmodel"]][["y"]], REPs[[r]][[i]][["RF"]][["RFmodel"]][["votes"]])
+  
+  #Calculate log-loss RF test
+  REPs[[r]][[i]][["predictRFtestlogloss"]]<-mlogLoss(REPs[[r]][[i]][["test"]][,"Sample_Group"],REPs[[r]][[i]][["predictRFtest"]][["Votes"]])
+
+  #Calculate log-loss LR test 
+  REPs[[r]][[i]][["predictLRtestlogloss"]]<-mlogLoss(REPs[[r]][[i]][["test"]][,"Sample_Group"],as.data.frame(REPs[[r]][[i]][["predictLRtest"]][["Prob_for_ROC"]]))
+
+  # Calculate log-loss RF UMCU 
+  REPs[[r]][[i]][["predictRFumcuvallogloss"]]<-mlogLoss(annoinputval[,1],REPs[[r]][[i]][["predictRFumcuval"]][["Votes_for_ROC"]])
+
+  #Calculate log-loss LR UMCU (first convert prob to df compatible with .roc)
+  REPs[[r]][[i]][["predictLRumcuvallogloss"]]<-mlogLoss(annoinputval[,1],REPs[[r]][[i]][["predictLRumcuval"]][["Prob_for_ROC"]])
+}}
+
+newdir<-"03_nestedCV"
+ifelse(!dir.exists(file.path(getwd(), newdir)), dir.create(file.path(getwd(), newdir)), FALSE)
+
+myfile <- file.path(paste0("./03_nestedCV/nestedCVREPs","seed",Seed,"rep",repeats,"tr",Trees,"l",Lambda,"a",Alpha,"nf",Nfolds,Sys.Date(),".rData"))
+save(REPs, file = myfile)
+UMCU_prepped <- file.path(paste0("./03_nestedCV/UMCU_selection_prepped",".rData"))
+save(UMCU_selection_prepped,PD_UMCU_selection_prepped, file = UMCU_prepped)
+```
+
+```{r}
+Sys.time()
+```
+

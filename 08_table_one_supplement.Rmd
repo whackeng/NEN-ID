@@ -1,0 +1,43 @@
+---
+title: "08-table-one-supplement"
+author: "Wenzel Hackeng"
+date: "22/10/2020"
+output: html_document
+---
+
+First call the required packages 
+```{r message=FALSE, warning=FALSE}
+library(readxl)
+library(table1)
+```
+
+# 1 Load data
+```{r message=FALSE, warning=FALSE}
+OnlineDataGEO <- read_excel("./08_table_one_supplement/Baseline.xlsx",
+sheet = "Combined", col_types = c("text", "text", "text", "text", "text", "numeric"), na = "999")
+```
+
+# 2 get table 1
+```{r message=FALSE, warning=FALSE}
+# Factor the basic variables that we're interested in
+OnlineDataGEO$Study <- factor(OnlineDataGEO$Study, levels=c(0,1,2,3,4),labels=c("Karpathakis et al.","Laddha et al.", "Chan et al.", "Hackeng et al.", "Additional case series"))
+
+OnlineDataGEO$SampleSite <- factor(OnlineDataGEO$SampleSite, levels=c(0,1,2,3,4,5,6,7,8,9,10,11),labels=c("Ileum","Terminal Ileum", "Ileocaecal",
+"Right Lower Lobe", "Right Middle Lobe", "Right Upper Lobe", "Left Lower Lobe" , "Lingula", "Left Upper Lobe",
+"Pancreas", "Liver", "Lymph node"))
+
+OnlineDataGEO$Origin <- factor(OnlineDataGEO$Origin, levels=c(0,1,2,3),labels=c("Ileum","Lung", "Pancreas","Unknown Primary"))
+
+OnlineDataGEO$Gender <- factor(OnlineDataGEO$Gender, levels=c(0,1),labels=c("Male","Female"))
+
+table1(~ 
+       + Age
+       + Gender
+       + Origin
+       + SampleSite
+       | Study,
+       data=OnlineDataGEO, overall=FALSE)
+
+
+```
+

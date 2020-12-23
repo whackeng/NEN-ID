@@ -1,0 +1,270 @@
+---
+title: "01-loading_and_normalizingIlealNET"
+author: "Wenzel Hackeng"
+date: "22/10/2020"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## **Pre-processing**
+First call the required packages
+```{r message=FALSE, warning=FALSE}
+library("GEOquery")
+library("ChAMP")
+library("readxl")
+library("readr")
+library("plyr")
+```
+# GEO load Small Intestinal Neuroendocrine tumors
+Download Phenotype data and link to case information. Put this file and the PD file in TextFiles folder (GEO data and the supplementary files from Karpathakis et al. 2016 were linked based on age, sex, FF-FFPE, Ki-67 count, Tumor-normal in this excel file). Now load all seperate GSM.soft data (Karpathakis et al. 2016). 
+ 
+```{r eval=FALSE}
+dir.create("RAW")
+gset <- getGEO("GSE73832", GSEMatrix =TRUE, getGPL=FALSE)
+if (length(gset) > 1) idx <- grep("GPL13534", attr(gset, "names")) else idx <- 1
+gset <- gset[[idx]]
+GSE73832_phenodata<- as.data.frame(pData(gset))
+
+library(readxl)
+Karpathakis_Linking_Cases <- read_excel("./RAW/GSE73832/TextFiles/Karpathakis_Linking_Cases.xlsx", sheet = "Combined GEO and Supplementary")
+GSMs<-Karpathakis_Linking_Cases$GSM_num
+
+dir.create("./RAW/GSE73832/GSMFiles")
+for(i in GSMs){
+getGEOfile(i, destdir = './RAW/GSE73832/GSMFiles', AnnotGPL = FALSE, amount = c("data"))
+}
+```
+
+# Data wrangling
+Of note, these data are already BMIQ normalized, but not filtered. 
+```{r message=FALSE, warning=FALSE}
+Karpathakis_Linking_Cases <- read_excel("./RAW/GSE73832/TextFiles/Karpathakis_Linking_Cases.xlsx", sheet = "Combined GEO and Supplementary")
+GSMs<-Karpathakis_Linking_Cases$GSM_num
+
+GSMdata <-list()
+for (i in GSMs){
+temp <- as.data.frame(read_table2(paste0("./RAW/GSE73832/GSMFiles/", i, ".soft", sep = ""), skip = 5))
+temp$Pval<-NULL
+colnames(temp)[3]<-"Pval"
+GSMdata[[i]]<-temp
+}
+
+
+# select ileal cases for further analysis
+IlealGSE73832<- subset(Karpathakis_Linking_Cases, 
+                       Sample_Group == "Primary Ileal" &
+                         Sample_Type == "FFPE")
+SIotherGSE73832<- subset(Karpathakis_Linking_Cases, 
+                       Sample_Group %in% c(
+                      "LiverMet SI NOS","Met SI NOS","OmenMet SI NOS","Primary SI_NOS")
+                         & Sample_Type %in% c("FFPE"))
+GIotherGSE73832<- subset(Karpathakis_Linking_Cases, 
+                       Sample_Group %in% c(
+                      "OmenMet Colon","Primary Appendix","Primary Colon","Primary DuodJej", "Primary Gastric")
+                         & Sample_Type %in% c("FFPE"))
+
+
+GSMsileal<-IlealGSE73832$GSM_num
+GSMsSIother<-SIotherGSE73832$GSM_num
+GSMsGIother<-GIotherGSE73832$GSM_num
+
+table(as.factor(Karpathakis_Linking_Cases$Sample_Group), as.factor(Karpathakis_Linking_Cases$Sample_Type))
+```
+
+# Data  filtering
+import newly made pd and filter. NB not filtered for beadcount! this information not provided the the GEO raw data. Determine % of probes with detection P-values >0.01. Select beta values from expression data.
+```{r message=FALSE, warning=FALSE}
+# function to check the fraction of failed probes
+FailProb<-function(dfinlist){
+  percFailProb<-nrow(dfinlist[dfinlist$Pval>0.01, ])/nrow(dfinlist)
+}
+
+# function to remove the failed probes 
+FilterOnSig<-function(dfinlist){
+  FilteredDF<-dfinlist[dfinlist$Pval<=0.01,]
+}
+
+# function to prep dataframes for merging betas and further analysus
+PrepGSMs<-function(dfinlist){
+  dfinlist["Pval"] <- NULL; dfinlist 
+}
+
+# Fraction of failed probes
+failedprobes<-lapply(GSMdata, FailProb)
+failedprobesileal<-as.data.frame(unlist(failedprobes[GSMsileal]))
+colnames(failedprobesileal)[1]<-"Failed CpG Fraction Ileal NETs"
+failedprobesileal
+
+# Fraction of failed probes other
+failedprobesSIother<-as.data.frame(unlist(failedprobes[GSMsSIother]))
+colnames(failedprobesSIother)[1]<-"Failed CpG Fraction other small intestinal"
+failedprobesSIother
+
+# Fraction of failed probes other
+failedprobesGIother<-as.data.frame(unlist(failedprobes[GSMsGIother]))
+colnames(failedprobesGIother)[1]<-"Failed CpG Fraction other gastro-intestinal"
+failedprobesGIother
+
+# removing failed probes and changing beta names
+FilteredList<-lapply(GSMdata, FilterOnSig)
+for (i in 1:length(GSMdata)) {
+  colnames(GSMdata[[i]])[2] <- names(GSMdata)[i]
+ } 
+
+# Prepping and merging betavalues
+FilteredListbetas<-lapply(FilteredList, PrepGSMs)
+for (i in 1:length(FilteredListbetas)) {
+  colnames(FilteredListbetas[[i]])[2] <- names(FilteredListbetas)[i]
+ } 
+
+# Ileal cases
+GSE73832ilealbetas<-join_all(FilteredListbetas[GSMsileal], by = "ID_REF", type = "inner", match = "all")
+GSE73832ilealbetas<-GSE73832ilealbetas[complete.cases(GSE73832ilealbetas), ]
+row.names(GSE73832ilealbetas)<-GSE73832ilealbetas[,1]
+GSE73832ilealbetas[,1]<-NULL
+
+# Other SI cases
+GSE73832SIotherbetas<-join_all(FilteredListbetas[GSMsSIother], by = "ID_REF", type = "inner", match = "all")
+GSE73832SIotherbetas<-GSE73832SIotherbetas[complete.cases(GSE73832SIotherbetas), ]
+row.names(GSE73832SIotherbetas)<-GSE73832SIotherbetas[,1]
+GSE73832SIotherbetas[,1]<-NULL
+
+# Other GI cases
+GSE73832GIotherbetas<-join_all(FilteredListbetas[GSMsGIother], by = "ID_REF", type = "inner", match = "all")
+GSE73832GIotherbetas<-GSE73832GIotherbetas[complete.cases(GSE73832GIotherbetas), ]
+row.names(GSE73832GIotherbetas)<-GSE73832GIotherbetas[,1]
+GSE73832GIotherbetas[,1]<-NULL
+
+#  ChAMP Filtering for ileal cases
+PD_GSE73832<-read.csv("./RAW/GSE73832/TextFiles/PD_GSE73832.csv", header=TRUE)
+set.seed(11)
+myloadilealGSE73832<-champ.filter(beta=GSE73832ilealbetas,
+                      pd=PD_GSE73832,
+                      intensity=NULL,
+                      Meth=NULL,
+                      UnMeth=NULL,
+                      detP=NULL,
+                      beadcount=NULL,
+                      autoimpute=TRUE,
+                      filterDetP=TRUE,
+                      ProbeCutoff=0,
+                      SampleCutoff=0.1,
+                      detPcut=0.01,
+                      filterBeads=FALSE,
+                      beadCutoff=0.05,
+                      filterNoCG = TRUE,
+                      filterSNPs = TRUE,
+                      population = NULL,
+                      filterMultiHit = TRUE,
+                      filterXY = TRUE,
+                      fixOutlier = FALSE,
+                      arraytype = "450K")
+
+mynormilealGSE73832<-myloadilealGSE73832[[1]]
+
+#  ChAMP Filtering for other small intestinal cases
+PD_SIotherGSE73832<-read.csv("./RAW/GSE73832/TextFiles/PD_SIotherGSE73832.csv", header=TRUE)
+myloadSIotherGSE73832<-champ.filter(beta=GSE73832SIotherbetas,
+                      pd=PD_SIotherGSE73832,
+                      intensity=NULL,
+                      Meth=NULL,
+                      UnMeth=NULL,
+                      detP=NULL,
+                      beadcount=NULL,
+                      autoimpute=FALSE,
+                      filterDetP=FALSE,
+                      ProbeCutoff=0,
+                      SampleCutoff=0.1,
+                      detPcut=0.01,
+                      filterBeads=FALSE,
+                      beadCutoff=0.05,
+                      filterNoCG = TRUE,
+                      filterSNPs = TRUE,
+                      population = NULL,
+                      filterMultiHit = TRUE,
+                      filterXY = TRUE,
+                      fixOutlier = FALSE,
+                      arraytype = "450K")
+
+mynormSIotherGSE73832<-myloadSIotherGSE73832[[1]]
+
+#  ChAMP Filtering for other gastro intestinal cases
+PD_GIotherGSE73832<-read.csv("./RAW/GSE73832/TextFiles/PD_GIotherGSE73832.csv", header=TRUE)
+myloadGIotherGSE73832<-champ.filter(beta=GSE73832GIotherbetas,
+                      pd=PD_GIotherGSE73832,
+                      intensity=NULL,
+                      Meth=NULL,
+                      UnMeth=NULL,
+                      detP=NULL,
+                      beadcount=NULL,
+                      autoimpute=FALSE,
+                      filterDetP=FALSE,
+                      ProbeCutoff=0,
+                      SampleCutoff=0.1,
+                      detPcut=0.01,
+                      filterBeads=FALSE,
+                      beadCutoff=0.05,
+                      filterNoCG = TRUE,
+                      filterSNPs = TRUE,
+                      population = NULL,
+                      filterMultiHit = TRUE,
+                      filterXY = TRUE,
+                      fixOutlier = FALSE,
+                      arraytype = "450K")
+
+mynormGIotherGSE73832<-myloadGIotherGSE73832[[1]]
+
+```
+
+# ChAMP Quality Control 
+NB. Samples were already normalized.  
+```{r message=FALSE, warning=FALSE}
+dir.create("./01_preprocessing/CHAMP_QCimages")
+champ.QC(beta = myloadilealGSE73832$beta,
+         pheno=myloadilealGSE73832$pd$Sample_Group,
+         mdsPlot=FALSE, # must be on MethylSet', 'RGChannelSet', or 'matrix'
+         densityPlot=FALSE,# must be on MethylSet', 'RGChannelSet', or 'matrix'
+         dendrogram=TRUE,
+         PDFplot=TRUE,
+         Rplot=TRUE,
+         Feature.sel="None",
+         resultsDir = "./01_preprocessing/CHAMP_QCimages/IlealGSE73832/")
+
+champ.QC(beta = myloadSIotherGSE73832$beta,
+         pheno=myloadSIotherGSE73832$pd$Sample_Group,
+         mdsPlot=FALSE, # must be on MethylSet', 'RGChannelSet', or 'matrix'
+         densityPlot=FALSE,# must be on MethylSet', 'RGChannelSet', or 'matrix'
+         dendrogram=TRUE,
+         PDFplot=TRUE,
+         Rplot=TRUE,
+         Feature.sel="None",
+         resultsDir = "./01_preprocessing/CHAMP_QCimages/SIotherGSE73832/")
+
+champ.QC(beta = myloadGIotherGSE73832$beta,
+         pheno=myloadGIotherGSE73832$pd$Sample_Group,
+         mdsPlot=FALSE, # must be on MethylSet', 'RGChannelSet', or 'matrix'
+         densityPlot=FALSE,# must be on MethylSet', 'RGChannelSet', or 'matrix'
+         dendrogram=TRUE,
+         PDFplot=TRUE,
+         Rplot=TRUE,
+         Feature.sel="None",
+         resultsDir = "./01_preprocessing/CHAMP_QCimages/GIotherGSE73832/")
+```
+
+# Save normalized data for later use
+```{r message=FALSE, warning=FALSE}
+dir.create("./01_preprocessing/PreProcessedDataSets")
+dir.create("./01_preprocessing/PreProcessedDataSets/IlealGSE73832")
+dir.create("./01_preprocessing/PreProcessedDataSets/SIotherGSE73832")
+dir.create("./01_preprocessing/PreProcessedDataSets/GIotherGSE73832")
+save(myloadilealGSE73832, mynormilealGSE73832, file = './01_preprocessing/PreProcessedDataSets/IlealGSE73832/preprocessedIlealGSE73832.rData')
+save(myloadSIotherGSE73832, mynormSIotherGSE73832, file = './01_preprocessing/PreProcessedDataSets/SIotherGSE73832/preprocessedSIotherGSE73832.rData')
+save(myloadGIotherGSE73832, mynormGIotherGSE73832, file = './01_preprocessing/PreProcessedDataSets/GIotherGSE73832/preprocessedGIotherGSE73832.rData')
+
+```
+

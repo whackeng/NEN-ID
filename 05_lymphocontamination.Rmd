@@ -1,0 +1,411 @@
+---
+title: "05_lymphocontamination"
+author: "Wenzel Hackeng"
+date: "29/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## **Pre-processing**
+First call the required packages
+```{r message=FALSE, warning=FALSE}
+library("GEOquery")
+library("data.table")
+library('readr')
+library('randomForest')
+library('glmnet')
+library('pROC')
+library('ModelMetrics')
+library('ggplot2')
+library('ggsci')
+library('tidyr')
+require('dplyr')
+```
+
+# function to randomly impute probes
+```{r}
+# function
+# impute beta values
+impute_random <- function(mat){
+  stopifnot(is.matrix(mat))
+  
+  if (all(is.na(mat))) {
+    warning("No non-NA data points, returning object unchanged")
+    na_num <- nrow(mat)
+    return(list(imputed = mat, n = na_num))
+  } else {
+    na_pos <- is.na(mat)
+    na_num <- sum(na_pos)
+    mat[na_pos] <- sample(x = mat[!na_pos], size = na_num, replace = TRUE)
+    return(list(imputed = mat, n = na_num))
+  }
+}
+```
+
+
+# Download normalized GEO data for lymphocytes
+Manually unzip files 
+```{r eval=FALSE}
+getGEOSuppFiles("GSE103541", makeDirectory = TRUE, baseDir =  './RAW')
+```
+
+# Preprocess GEO lymfocyte data, load model data, test-validation data 
+5 samples are already removed from the preprocessed GEO data due to low sample quality. These are still present in the PD file, but filtered when merging the data and PD file. The model data, test-validation data are preprocessed in 04_RandomProbeReplacement. Repeat 1, CV set 2 has perfect RF and RF+RR accuracy in the test data and the UMC data.CV Test and UMCU validation data are merged (unknown data to model)
+```{r eval=FALSE}
+NormalizedLymphocytes<-as.data.frame(fread("./RAW/GSE103541/GSE103541_NormalisedData.csv.gz"), stringsAsFactors = FALSE)
+PD_GSE103541 <- read_csv("./PD_FILES/PD_GSE103541.csv", skip = 7)
+PD_GSE103541select<-PD_GSE103541[,c("normSample_Name", "Sample_Group")]
+
+rownames(NormalizedLymphocytes)<-NormalizedLymphocytes[,1]
+NormalizedLymphocytes[,1]<-NULL
+tNormalizedLymphocytes<-t(NormalizedLymphocytes)
+
+AnnotNormalizedLymphocytes<-merge(PD_GSE103541select, tNormalizedLymphocytes, by.x = "normSample_Name", by.y = "row.names")
+rownames(AnnotNormalizedLymphocytes)<-AnnotNormalizedLymphocytes[,1]
+AnnotNormalizedLymphocytes[,1]<-NULL
+tAllLymphos<-AnnotNormalizedLymphocytes
+tAllLymphos[,c("Sample_Group")]<-NULL
+AllLymphos<-t(tAllLymphos)
+
+tBcells<-subset(AnnotNormalizedLymphocytes, Sample_Group == "Bcells")
+tBcells[,c("Sample_Group")]<-NULL
+Bcells<-as.data.frame(t(tBcells),stringsAsFactors=FALSE)
+
+tCD4<-subset(AnnotNormalizedLymphocytes, Sample_Group == "CD4")
+tCD4[,c("Sample_Group")]<-NULL
+CD4<-as.data.frame(t(tCD4),stringsAsFactors=FALSE)
+
+tCD8<-subset(AnnotNormalizedLymphocytes, Sample_Group == "CD8")
+tCD8[,c("Sample_Group")]<-NULL
+CD8<-as.data.frame(t(tCD8),stringsAsFactors=FALSE)
+
+tMonocytes<-subset(AnnotNormalizedLymphocytes, Sample_Group == "Monocytes")
+tMonocytes[,c("Sample_Group")]<-NULL
+Monocytes<-as.data.frame(t(tMonocytes),stringsAsFactors=FALSE)
+
+tGranulocytes<-subset(AnnotNormalizedLymphocytes, Sample_Group == "Granulocytes")
+tGranulocytes[,c("Sample_Group")]<-NULL
+Granulocytes<-as.data.frame(t(tGranulocytes),stringsAsFactors=FALSE)
+```
+
+
+# loading normalized TCGA data (previously normalized data by preprocessIllumina)
+Cases:
+ [1] "TCGA-H6-A45N" "TCGA-H6-8124" "TCGA-FZ-5922" "TCGA-YB-A89D" "TCGA-HV-A5A3"
+ [6] "TCGA-FZ-5920" "TCGA-FZ-5926" "TCGA-FZ-5923" "TCGA-FZ-5924" "TCGA-FZ-5919"
+ [1] "TCGA-50-5939" "TCGA-44-2662" "TCGA-44-6144" "TCGA-44-6145" "TCGA-50-5931"
+ [6] "TCGA-50-5930" "TCGA-50-5935" "TCGA-38-4631" "TCGA-50-6593" "TCGA-44-5645"
+```{r eval=FALSE}
+tcganormal_metadata <- readRDS("./RAW/TCGA/Normal/tcga-normal-metadata.rds")
+
+tcganormal_data <- as.data.frame(readRDS("./RAW/TCGA/Normal/tcga-normal-data.rds"))
+
+# Subset for normal tissue near pancreatic ductal adenocarcinoma, 
+PDnormalpancreas <- subset(tcganormal_metadata, tissue == "PAAD")
+#Cases for normal pancreas
+PDnormalpancreas$barcode
+
+PDnormallung <- subset(tcganormal_metadata, tissue == "LUAD")
+#Cases for normal lung
+PDnormallung$barcode
+
+Datanormalpancreas <- tcganormal_data[,PDnormalpancreas$basename]
+Datanormallung <- tcganormal_data[,PDnormallung$basename]
+```
+
+
+# Some literature on proportions of lymphocytes in normal and tumor draining lymph nodes 
+- CD4 69%, CD8 9%,  CD19 (B-cell) 15%, CD14 (monocyte) 3%, CD15 (granulocyte) unknown (1)
+- CD4 48%, CD8 10%, CD19 (B-cell) 41% (2)
+- CD4 47%, CD8 11%, CD19 (B-cell) 32%, monocyte 1%, granulocyte 3% (3)
+- T-cells between 50-60%, B-cells between 30-40% in normal and tumor draining lymphnodes (4)
+* so a rough estimate is that a typical lymph node would consist of approximately 55% CD4 cells, 10% CD8 cells and 35% B-cells *
+
+# Getting mean lymphocyte, and lymphocyte cell specific, lymphnode, pancreas and lung methylation
+```{r eval=FALSE}
+MeanLymphocytes<-as.data.frame(rownames(AllLymphos))
+MeanLymphocytes$ProbeMeanWB<-rowMeans(AllLymphos[,1:140], na.rm = TRUE)
+MeanLymphocytes$ProbeMeanBce<-rowMeans(Bcells[,1:28], na.rm = TRUE)
+MeanLymphocytes$ProbeMeanCD4<-rowMeans(CD4[,1:28], na.rm = TRUE)
+MeanLymphocytes$ProbeMeanCD8<-rowMeans(CD8[,1:28], na.rm = TRUE)
+MeanLymphocytes$ProbeMeanGranulocytes<-rowMeans(Monocytes[,1:28], na.rm = TRUE)
+MeanLymphocytes$ProbeMeanMonocytes<-rowMeans(Granulocytes[,1:28], na.rm = TRUE)
+MeanLymphocytes$Lymphnode<-((MeanLymphocytes$ProbeMeanCD4*55)+(MeanLymphocytes$ProbeMeanCD8*10)+(MeanLymphocytes$ProbeMeanBce*35))/100
+rownames(MeanLymphocytes)<-MeanLymphocytes[,1]
+MeanLymphocytes[,1]<-NULL
+
+MeanNormal<-as.data.frame(rownames(Datanormallung))
+MeanNormal$ProbeMeanlung<-rowMeans(Datanormallung[,1:10], na.rm = TRUE)
+MeanNormal$ProbeMeanpancreas<-rowMeans(Datanormalpancreas[,1:10], na.rm = TRUE)
+rownames(MeanNormal)<-MeanNormal[,1]
+MeanNormal[,1]<-NULL
+
+MeanContamination<-merge(MeanLymphocytes, MeanNormal, by.x="row.names", by.y="row.names")
+rownames(MeanContamination)<-MeanContamination[,1]
+MeanContamination[,1]<-NULL
+```
+
+# save for R using too much memory 
+```{r eval=FALSE}
+newdir<-"05_Contamination"
+ifelse(!dir.exists(file.path(getwd(), newdir)), dir.create(file.path(getwd(), newdir)), FALSE)
+save(MeanContamination, file = file.path("./05_Contamination/MeanContamination.rData"))
+```
+
+# restart R for memory, prep data
+```{r message=FALSE, warning=FALSE}
+# load model, test-validation set data
+load('09_finalmodel/finalRF_and_LRseed13tr500llambda.1sea0nf3.rData')
+load('03_nestedCV/UMCU_selection_prepped.rData')
+load('05_Contamination/MeanContamination.rData')
+
+rf_train<-finalRF$RFmodel
+lr_train<-finalLR$Ridgemodel
+
+# change annotations to output model
+PD_UMCU_selection_prepped$Sample_Group<-as.character(PD_UMCU_selection_prepped$Sample_Group)
+PD_UMCU_selection_prepped[PD_UMCU_selection_prepped$Sample_Group=="CasePan","Sample_Group"]<-"PanNET"
+PD_UMCU_selection_prepped[PD_UMCU_selection_prepped[,"Sample_Group"]=="CaseIleum","Sample_Group"]<-"IlealNET"
+PD_UMCU_selection_prepped[PD_UMCU_selection_prepped[,"Sample_Group"]=="CaseLung","Sample_Group"]<-"PulmNET"
+PD_UMCU_selection_prepped$Sample_Group<-as.factor(PD_UMCU_selection_prepped$Sample_Group)
+
+# Merge with annotations
+UMCU_selection_prepped<-merge(PD_UMCU_selection_prepped[,c("Sample_Name","Sample_Group")], t(UMCU_selection_prepped), by.x="Sample_Name", by.y= "row.names")
+row.names(UMCU_selection_prepped)<-UMCU_selection_prepped[,1]
+UMCU_selection_prepped[,1]<-NULL
+
+Origin<-subset(UMCU_selection_prepped, select = c(Sample_Group))
+Betas<-as.data.frame(apply(subset(UMCU_selection_prepped, select = -c(Sample_Group)), 2, as.numeric))
+rownames(Betas)<-rownames(UMCU_selection_prepped)
+
+ContBetas<-merge(MeanContamination, t(Betas), by.x="row.names", by.y="row.names", all.y = TRUE)
+rownames(ContBetas) <- ContBetas[,1]
+ContBetas[,1] <- NULL
+
+rfprobes<-colnames(as.data.frame(rf_train$forest$xlevels))
+NAsLymphoBeta<-rownames(subset(ContBetas,is.na(ContBetas$ProbeMeanWB)))
+NAsPanBeta<-rownames(subset(ContBetas,is.na(ContBetas$ProbeMeanpancreas)))
+NAsLungBeta<-rownames(subset(ContBetas,is.na(ContBetas$ProbeMeanlung)))
+
+#number of relevant probes in the mean lymphocyte values which will be imputed
+length(intersect(rfprobes, NAsLymphoBeta))
+
+#number of relevant probes in the mean pancreas values which will be imputed
+length(intersect(rfprobes, NAsPanBeta))
+
+#number of relevant probes in the mean lung values which will be imputed
+length(intersect(rfprobes, NAsLungBeta))
+
+```
+# Simulate lymphocyte contamination
+```{r message=FALSE, warning=FALSE}
+## set seed
+Seed <- 13
+set.seed(Seed)
+
+## stuff to adjust
+#percentage of lymphocyte contamination
+Perc<-seq(5, 95, by=5)/100
+TestSet<-ContBetas[,10:32]
+# impute missing probes for mean lymphocytes
+Means<-as.data.frame(impute_random(as.matrix(ContBetas[,1:9])), stringsAsFactors=FALSE)[,1:9]
+Cols<-ncol(TestSet)
+
+PerclistCont<-list()
+
+for(p in seq_along(Perc)){
+  Contamination<-list()
+  for(c in seq_along(colnames(Means))){
+    TestSet_temp<-apply(TestSet,2,function(column){
+      ((column*(10-(Perc[p]*10)))+((Means[,c])*(Perc[p]*10)))/10
+    })
+      # Transpose data (probes in columns) for predicting
+  tTestSet_temp<-as.data.frame(t(TestSet_temp), stringsAsFactors=FALSE)
+  
+  # RF raw score output
+  RF_response<-predict(rf_train, tTestSet_temp, type = 'response')
+  RF_prob<-predict(rf_train, tTestSet_temp, type = 'prob')
+  rf_acc_calc<-data.frame(as.character(Origin$Sample_Group),as.character(RF_response),stringsAsFactors=FALSE)
+  RF_Accuracy=sum(rf_acc_calc[,1]==rf_acc_calc[,2], na.rm = TRUE)/nrow(rf_acc_calc) 
+  RF_mROC<-multiclass.roc(Origin$Sample_Group, RF_prob, percent = TRUE, plot = FALSE)
+  RF_Logloss<-mlogLoss(Origin$Sample_Group,RF_prob)
+    
+  LR_response<-predict(lr_train, newx =  RF_prob, s = lr_train[["lambda"]], type = "class")
+  LR_prob<-predict(lr_train, newx =  RF_prob, s = lr_train[["lambda"]], type = "response")
+   lr_acc_calc<-data.frame(as.character(Origin$Sample_Group),as.character(LR_response),stringsAsFactors=FALSE)
+  LR_Accuracy=sum(lr_acc_calc[,1]==lr_acc_calc[,2], na.rm = TRUE)/nrow(lr_acc_calc) 
+  
+    # prepare data for ROC prediction
+    LRProb_for_ROC<-as.data.frame(LR_prob)
+    colnames(LRProb_for_ROC)<- c("IlealNET", "PanNET", "PulmNET")
+  LR_mROC<-multiclass.roc(Origin$Sample_Group, LRProb_for_ROC, percent = TRUE, plot = FALSE)
+  LR_Logloss<-mlogLoss(Origin$Sample_Group,LRProb_for_ROC)
+   
+  # put data in list
+  Contamination[[colnames(Means)[c]]] <- list()
+  Contamination[[colnames(Means)[c]]][["RF_Accuracy"]] <- RF_Accuracy
+  Contamination[[colnames(Means)[c]]][["RF_response"]] <- RF_response
+  Contamination[[colnames(Means)[c]]][["RF_prob"]] <- RF_prob
+  Contamination[[colnames(Means)[c]]][["RF_mROC"]] <- RF_mROC
+  Contamination[[colnames(Means)[c]]][["RF_Logloss"]] <- RF_Logloss
+  Contamination[[colnames(Means)[c]]][["LR_Accuracy"]] <- LR_Accuracy
+  Contamination[[colnames(Means)[c]]][["LR_response"]] <- LR_response
+  Contamination[[colnames(Means)[c]]][["LR_prob"]] <- LR_prob
+  Contamination[[colnames(Means)[c]]][["LR_mROC"]] <- LR_mROC
+  Contamination[[colnames(Means)[c]]][["LR_Logloss"]] <- LR_Logloss
+  }
+PerclistCont[[paste(Perc[p]*100, "% contamination")]]<-Contamination
+}
+
+newdir<-"05_Contamination"
+ifelse(!dir.exists(file.path(getwd(), newdir)), dir.create(file.path(getwd(), newdir)), FALSE)
+
+myfile <- file.path(paste0("./05_Contamination/PerclistCont","seed",Seed,"NumOfPercSteps",length(Perc),".rData"))
+save(PerclistCont, file = myfile)
+
+```
+
+# Collecting and combining results from list
+```{r message=FALSE, warning=FALSE}
+results <- matrix(nrow=length(Perc)*9, ncol=(9))
+results[,1]<-rep(Perc*100, 9)
+results[,2]<-paste(Seed, "Seed")
+for (p in seq_along(Perc)){
+  results[p,3]<-"Perfect_Mix_Cells"
+  results[p+1*length(Perc),3]<-"B_Cells"
+  results[p+2*length(Perc),3]<-"CD4_Cells"
+  results[p+3*length(Perc),3]<-"CD8_Cells"
+  results[p+4*length(Perc),3]<-"Granulocytes"
+  results[p+5*length(Perc),3]<-"Monocytes"
+  results[p+6*length(Perc),3]<-"Sim_Lymph_Node"
+  results[p+7*length(Perc),3]<-"Lung"
+  results[p+8*length(Perc),3]<-"Pancreas"
+  
+  results[p,4]<-PerclistCont[[p]][[1]][[1]]
+  results[p+1*length(Perc),4]<-PerclistCont[[p]][[2]][[1]]
+  results[p+2*length(Perc),4]<-PerclistCont[[p]][[3]][[1]]
+  results[p+3*length(Perc),4]<-PerclistCont[[p]][[4]][[1]]
+  results[p+4*length(Perc),4]<-PerclistCont[[p]][[5]][[1]]
+  results[p+5*length(Perc),4]<-PerclistCont[[p]][[6]][[1]]
+  results[p+6*length(Perc),4]<-PerclistCont[[p]][[7]][[1]]
+  results[p+7*length(Perc),4]<-PerclistCont[[p]][[8]][[1]]
+  results[p+8*length(Perc),4]<-PerclistCont[[p]][[9]][[1]]
+
+  results[p,5]<-PerclistCont[[p]][[1]][[4]][[6]]/100
+  results[p+1*length(Perc),5]<-PerclistCont[[p]][[2]][[4]][[6]]/100
+  results[p+2*length(Perc),5]<-PerclistCont[[p]][[3]][[4]][[6]]/100
+  results[p+3*length(Perc),5]<-PerclistCont[[p]][[4]][[4]][[6]]/100
+  results[p+4*length(Perc),5]<-PerclistCont[[p]][[5]][[4]][[6]]/100
+  results[p+5*length(Perc),5]<-PerclistCont[[p]][[6]][[4]][[6]]/100
+  results[p+6*length(Perc),5]<-PerclistCont[[p]][[7]][[4]][[6]]/100
+  results[p+7*length(Perc),5]<-PerclistCont[[p]][[8]][[4]][[6]]/100
+  results[p+8*length(Perc),5]<-PerclistCont[[p]][[9]][[4]][[6]]/100
+  
+  results[p,6]<-PerclistCont[[p]][[1]][[5]]
+  results[p+1*length(Perc),6]<-PerclistCont[[p]][[2]][[5]]
+  results[p+2*length(Perc),6]<-PerclistCont[[p]][[3]][[5]]
+  results[p+3*length(Perc),6]<-PerclistCont[[p]][[4]][[5]]
+  results[p+4*length(Perc),6]<-PerclistCont[[p]][[5]][[5]]
+  results[p+5*length(Perc),6]<-PerclistCont[[p]][[6]][[5]]
+  results[p+6*length(Perc),6]<-PerclistCont[[p]][[7]][[5]]
+  results[p+7*length(Perc),6]<-PerclistCont[[p]][[8]][[5]]
+  results[p+8*length(Perc),6]<-PerclistCont[[p]][[9]][[5]]
+  
+  results[p,7]<-PerclistCont[[p]][[1]][[6]]
+  results[p+1*length(Perc),7]<-PerclistCont[[p]][[2]][[6]]
+  results[p+2*length(Perc),7]<-PerclistCont[[p]][[3]][[6]]
+  results[p+3*length(Perc),7]<-PerclistCont[[p]][[4]][[6]]
+  results[p+4*length(Perc),7]<-PerclistCont[[p]][[5]][[6]]
+  results[p+5*length(Perc),7]<-PerclistCont[[p]][[6]][[6]]
+  results[p+6*length(Perc),7]<-PerclistCont[[p]][[7]][[6]]
+  results[p+7*length(Perc),7]<-PerclistCont[[p]][[8]][[6]]
+  results[p+8*length(Perc),7]<-PerclistCont[[p]][[9]][[6]]
+
+  results[p,8]<-PerclistCont[[p]][[1]][[9]][[6]]/100
+  results[p+1*length(Perc),8]<-PerclistCont[[p]][[2]][[9]][[6]]/100
+  results[p+2*length(Perc),8]<-PerclistCont[[p]][[3]][[9]][[6]]/100
+  results[p+3*length(Perc),8]<-PerclistCont[[p]][[4]][[9]][[6]]/100
+  results[p+4*length(Perc),8]<-PerclistCont[[p]][[5]][[9]][[6]]/100
+  results[p+5*length(Perc),8]<-PerclistCont[[p]][[6]][[9]][[6]]/100
+  results[p+6*length(Perc),8]<-PerclistCont[[p]][[7]][[9]][[6]]/100
+  results[p+7*length(Perc),8]<-PerclistCont[[p]][[8]][[9]][[6]]/100
+  results[p+8*length(Perc),8]<-PerclistCont[[p]][[9]][[9]][[6]]/100
+  
+  results[p,9]<-PerclistCont[[p]][[1]][[10]]
+  results[p+1*length(Perc),9]<-PerclistCont[[p]][[2]][[10]]
+  results[p+2*length(Perc),9]<-PerclistCont[[p]][[3]][[10]]
+  results[p+3*length(Perc),9]<-PerclistCont[[p]][[4]][[10]]
+  results[p+4*length(Perc),9]<-PerclistCont[[p]][[5]][[10]]
+  results[p+5*length(Perc),9]<-PerclistCont[[p]][[6]][[10]]
+  results[p+6*length(Perc),9]<-PerclistCont[[p]][[7]][[10]]
+  results[p+7*length(Perc),9]<-PerclistCont[[p]][[8]][[10]]
+  results[p+8*length(Perc),9]<-PerclistCont[[p]][[9]][[10]]
+}
+  
+results<-as.data.frame(results, stringsAsFactors = FALSE)
+names(results)<-c("Percentage","Seed","Group","RF_Accuracy","RF_AUC","RF_LogLoss", "LR_Accuracy","LR_AUC","LR_LogLoss")
+
+results[,c(1,4:9)]<-apply(results[,c(1,4:9)], 2, as.numeric)
+results_long <- gather(results, OutputType, Output, RF_Accuracy:LR_LogLoss, factor_key=TRUE)
+
+
+```
+
+# plot results
+```{r message=FALSE, warning=FALSE}
+# plot results
+Legend<-TRUE
+results_longsub<-subset(results_long, OutputType != "RF_AUC" & OutputType!="LR_AUC" & Group!="Perfect_Mix_Cells")
+
+ggplot(data=results_longsub, aes(x=Percentage, y=Output, color=OutputType, shape=Group))+
+  geom_line(size=2, show.legend = Legend)+
+  geom_point(size=3, show.legend = Legend)+
+  scale_shape_manual(values=1:nlevels(as.factor(results_longsub$Output)))+
+  theme(
+    panel.border = element_blank(),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    legend.key=element_blank(),
+    legend.background=element_blank())+
+  labs(x= "Percentage of Contamination", y="Accuracy", color  = "Model Metrics", linetype = "Model Metrics", shape = "Sorted Cells")
+
+ggsave("Contamination_leg.eps", path = "./05_Contamination/", width = 7.5,
+  height = 4,
+  units = "in")
+
+# plot results
+Legend<-FALSE
+results_longsub<-subset(results_long, OutputType != "RF_AUC" & OutputType!="LR_AUC" & Group!="Perfect_Mix_Cells")
+
+ggplot(data=results_longsub, aes(x=Percentage, y=Output, color=OutputType, shape=Group))+
+  geom_line(size=2, show.legend = Legend)+
+  geom_point(size=3, show.legend = Legend)+
+  scale_shape_manual(values=1:nlevels(as.factor(results_longsub$Output)))+
+  theme(
+    panel.border = element_blank(),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    legend.key=element_blank(),
+    legend.background=element_blank())+
+  labs(x= "Percentage of Contamination", y="Accuracy", color  = "Model Metrics", linetype = "Model Metrics", shape = "Sorted Cells")
+
+ggsave("Contamination_noleg.eps", path = "./05_Contamination/", width = 7.5,
+  height = 4,
+  units = "in")
+
+```
+
+References:
+(1) Tedla, N., et al. "Phenotypic and functional characterization of lymphocytes derived from normal and HIV-1-infected human lymph nodes." Clinical and experimental immunology 117.1 (1999): 92.
+(2) Battaglia, Alessandra, et al. "Lymphocyte populations in human lymph nodes. Alterations in CD4+ CD25+ T regulatory cell phenotype and T‐cell receptor Vβ repertoire." Immunology 110.3 (2003): 304-312.
+(3) Stankovic, Branislava, et al. "Immune cell composition in human non-small cell lung cancer." Frontiers in immunology 9 (2019): 3101.
+(4) Setiadi, A. Francesca, et al. "Quantitative, architectural analysis of immune cell subsets in tumor-draining lymph nodes from breast cancer patients and healthy lymph nodes." PLoS One 5.8 (2010).
+
+

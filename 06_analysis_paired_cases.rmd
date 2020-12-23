@@ -1,0 +1,291 @@
+---
+title: "analysis-paired-cases"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Introduction
+
+The UMCU test cohort contains two instances of pancreatic NETs with matching data from multiple tissues. One is a pair of primary/metastasis, the other one a triplet with one primary and two metastases. 
+
+In this analysis I used data for 65 SNPs included in the EPIC array to confirm samples come from the same patient and to select the pairs in a data-driven way. To answer the question whether the methylation profile is retained between primaries and metastases I looked at the similarity of (1) beta values and (2) RF classification output. 
+
+
+Overview of matched cases: 
+
+| Case 1                      | Case 2                     |
+| --------------------------- | -------------------------- |
+| 201533570026_R01C01 (Prim)  | 201533570026_R02C01 (M1)   | Patient 1, comparison 1
+| 201533570026_R01C01 (Prim)  | 201533570026_R03C01 (M2)   | Patient 1, comparison 2
+| 201533570026_R02C01 (M1)    | 201533570026_R03C01 (M2)   | Patient 1, comparison 3
+| 202081130239_R04C01 (M)     | 202081130239_R05C01 (Prim) | Patient 2, comparison 1
+
+
+
+
+## Data Import
+
+```{r, echo = FALSE}
+library(tidyverse)
+library(minfi)
+library(pheatmap)
+library(cowplot)
+library(randomForest)
+
+# include some global helper functions
+# helper function for automated preprocessing
+preprocess_wrapper <- function(basenames, out_dir, preprocessFunction = NULL){
+  data <- minfi::read.metharray(basenames = basenames)
+  fun_norm <- ifelse(is.null(preprocessFunction),  minfi::preprocessIllumina, preprocessFunction)
+  data <- fun_norm(data)
+  data <- minfi::getBeta(data)
+  for (i in colnames(data)){
+    saveRDS(object = data[, i, drop = FALSE], file = file.path(out_dir, paste0(i, ".rds")))
+  }
+}
+
+cor_mat_to_tibble <- function(mat, values){
+  mat <- as_tibble(x = mat, rownames = "source")
+  mat <- mat %>% 
+    pivot_longer(cols = 2:ncol(.),
+                 names_to = "target",
+                 values_to = values,
+                 values_drop_na = TRUE)
+}
+
+clean_data <- function(tib){
+  
+  # change sample name
+  sn <- str_extract(colnames(tib)[2], pattern ="^[^_]*" )
+  sn <-  paste0("il_", sn)
+  
+  # filter based on p-value
+  pfilt <- tib[, 3, drop = TRUE] > 0.01
+  tib <- tib[!pfilt, 1:2]
+  
+  # change column names, return
+  colnames(tib) <- c("id_ref", sn)
+  return(tib)
+}
+
+
+impute_random <- function(matrix){
+  
+  n_na <- sum(is.na(matrix))
+  message(paste0("Imputing n = ", n_na, " missing values"))
+  
+  if (n_na == 0) {
+    return(matrix)
+  } else {
+    matrix[is.na(matrix)] <- sample(x = matrix[!(is.na(matrix))], size = n_na)
+    return(matrix)
+  }
+}
+
+
+# list basenames
+list_basenames <- function(dir){
+  basenames <- list.files(path = dir,
+                          full.names = TRUE,
+                          pattern = "_Grn.idat")
+  basenames <- str_replace(string = basenames, pattern = "_Grn.idat", replacement = "")
+  return(basenames)
+}
+
+# upper triangle matrix
+upper_tri <- function(mat){
+  diag(mat) <- NA
+  mat[lower.tri(mat)] <- NA
+  return(mat)
+}
+```
+
+
+```{r, results='hide', echo = FALSE}
+
+# Sample annotation (cleaned manually beforehand)
+metadata <- read_csv(file = "./PD_FILES/PD_UMCUsamples.csv", 
+    skip = 7)
+metadata$id<-paste0(metadata$Sentrix_ID,"_",metadata$Sentrix_Position)
+metadata$Sample_Group[metadata$Sample_Group=="CasePan"]<-"PanNET"
+metadata$Sample_Group[metadata$Sample_Group=="CaseIleum"]<-"IlealNET"
+metadata$Sample_Group[metadata$Sample_Group=="CaseLung"]<-"PulmNET"
+metadata$Sample_Group[metadata$Sample_Group=="CaseUP"]<-"PulmNET"
+
+# Random Forest model (also, extract probe names)
+load("./09_finalmodel/finalRF_and_LRseed13tr500llambda.1sea0nf3.rData")  
+rf_probes <- finalRF$RFmodel$forest$xlevels %>%
+  unlist %>%
+  names
+
+# Methylation Data
+data_dir <- "./RAW/UMCU/IdatFiles/"
+basenames <- list_basenames(dir = data_dir)
+
+raw_data <- read.metharray(basenames = basenames, force = TRUE)
+preprocessed <- minfi::preprocessIllumina(raw_data)
+
+# Extract Beta values & SNP values
+snp_values <- getSnpBeta(raw_data)
+beta_values <- minfi::getBeta(preprocessed)
+
+# Random Imputation for Beta values
+set.seed(13)
+beta_values <- impute_random(beta_values)
+beta_values_rf <- beta_values[rf_probes, ]
+#
+
+```
+
+
+## Calculate correlations
+```{r, fig.height=6, fig.width=6}
+
+# Calculate correlations
+cor_beta <- cor(beta_values) %>% 
+  upper_tri %>% 
+  cor_mat_to_tibble(values = "cor_beta")
+
+cor_beta_rf <- cor(beta_values_rf) %>% 
+  upper_tri %>% 
+  cor_mat_to_tibble(values = "cor_beta_rf")
+
+cor_snp <- cor(snp_values) %>% 
+  upper_tri %>% 
+  cor_mat_to_tibble(values = "cor_snp")
+
+pheatmap(cor(snp_values))
+
+
+```
+
+## Combine data and add annotation 
+
+```{r}
+
+# Merge
+cor_data <- Reduce(f = full_join, x = list(cor_snp, cor_beta, cor_beta_rf))
+
+# Extract tumor type from metadata
+cor_data <- cor_data %>% 
+  add_column(diag_source = metadata$Sample_Group[match(cor_data$source, metadata$id)], 
+             diag_target = metadata$Sample_Group[match(cor_data$target, metadata$id)])
+
+# Add additional variables (matched vs. ummatched cases and same vs. different NET types)
+cor_data <- cor_data %>% 
+  mutate(diag_group = ifelse(diag_source == diag_target, "within", "between"), 
+         matched = ifelse(cor_snp > 0.8, "matched", "unmatched"))
+
+# take a look
+head(cor_data)
+
+# look at paired samples
+cor_data %>%
+  filter(matched == "matched")
+
+```
+
+
+## Look at Beta Value correlations
+
+```{r}
+
+# all probes
+cor_data %>% 
+  filter(diag_source != "UpNET") %>% 
+  ggplot(aes(diag_source, cor_beta)) +
+  geom_boxplot(aes(fill = diag_source)) +
+  facet_wrap(~ diag_group) +
+  labs(x = NULL, y = "Correlation Beta Values (all probes)") +
+  theme_cowplot(font_size = 12) +
+  theme(legend.position = "none")
+  
+# only RF probes
+cor_data %>% 
+  filter(diag_source != "UpNET") %>% 
+  ggplot(aes(diag_source, cor_beta_rf)) +
+  geom_boxplot(aes(fill = diag_source)) +
+  facet_wrap(~ diag_group) +
+  labs(x = NULL, y = "Correlation Beta Values (Only RF probes)") +
+  theme_cowplot(font_size = 12) +
+  theme(legend.position = "none")
+ 
+
+
+## correlation of matched vs. unmatched samples within PanNETs
+
+# all probes
+cor_data %>% 
+  filter(diag_source == "PanNET") %>% 
+  filter(diag_group == "within") %>% 
+  pivot_longer(cols = c("cor_beta", "cor_beta_rf"), names_to = "probes", values_to = "cor_beta") %>% 
+  mutate(probes = ifelse(probes == "cor_beta", "All Probes", "RF Probes")) %>% 
+  ggplot(aes(matched, cor_beta)) +
+  geom_boxplot(aes(fill = matched)) +
+  facet_wrap(~ probes) +
+  labs(x = NULL, y = "Correlation Beta Values") +
+  theme_cowplot(font_size = 12) +
+  theme(legend.position = "none")
+
+dir.create("06_analysis_paired_cases")
+ggsave("PairedCases.eps", path = "./06_analysis_paired_cases/", width = 6,
+  height = 4,
+  units = "in")
+
+```
+
+
+## Compare RF model output
+
+```{r}
+rf_scores_raw <- predict(object = finalRF$RFmodel, newdata = t(beta_values_rf), type = "prob")
+rf_class <- predict(object = finalRF$RFmodel, newdata = t(beta_values_rf), type = "response")
+
+rf_scores <- rf_scores_raw %>% 
+  as.data.frame %>% 
+  as_tibble(rownames = "id") %>% 
+  pivot_longer(cols = 2:ncol(.), names_to = "class", values_to = "class_score")
+
+rf_data <- full_join(rf_scores, cor_data, by = c("id" = "source"))
+rf_data <- full_join(rf_data, rf_scores, by = c("target" = "id"))
+
+rf_data <- rf_data %>% 
+  dplyr::rename(class_source = class.x, 
+                class_score_source = class_score.x, 
+                class_target = class.y, 
+                class_score_target = class_score.y, 
+                source = id)
+rf_data <- rf_data %>% 
+  relocate(source, target, diag_source, diag_target, diag_group, matched, cor_snp,
+           cor_beta, cor_beta_rf, class_source, class_target, class_score_source, class_score_target)
+
+rf_data %>% 
+  filter(diag_source == diag_target) %>% 
+  filter(class_source == class_target) %>%
+  ggplot(aes(class_score_source, class_score_target)) +
+  geom_point(fill = "steelblue", size = 3, shape = 21) +
+  facet_wrap(~ matched) +
+  theme_cowplot(12) +
+  labs(x = "RF scores Sample 1", y = "RF scores Sample 2")
+
+ggsave("PairedCasesRF.eps", path = "./06_analysis_paired_cases/", width = 6,
+  height = 4,
+  units = "in")
+
+rf_data %>% 
+  filter(diag_source == diag_target) %>% 
+  filter(class_source == class_target) %>%
+  group_by(matched) %>% 
+  summarise(rf_score_cor = cor(class_score_source, class_score_target))
+```
+
+
+
+
+
+
+

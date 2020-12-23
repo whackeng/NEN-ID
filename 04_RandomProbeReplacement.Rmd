@@ -1,0 +1,262 @@
+---
+title: "04-randomprobeReplacement"
+author: "Wenzel Hackeng"
+output: html_document
+date: "29/10/2020"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+First call the required packages 
+```{r message=FALSE, warning=FALSE}
+library('dplyr')
+library('randomForest')
+library('glmnet')
+library('pROC')
+library('ModelMetrics')
+library('ggplot2')
+library('readr')
+```
+
+# Load data
+```{r load, message=FALSE, warning=FALSE}
+load('09_finalmodel/finalRF_and_LRseed13tr500llambda.1sea0nf3.rData')
+load('03_nestedCV/UMCU_selection_prepped.rData')
+```
+
+# Prep data
+Take final model and UMCU test cohort 
+```{r prep, message=FALSE, warning=FALSE}
+# change annotations to output model
+PD_UMCU_selection_prepped$Sample_Group<-as.character(PD_UMCU_selection_prepped$Sample_Group)
+PD_UMCU_selection_prepped[PD_UMCU_selection_prepped$Sample_Group=="CasePan","Sample_Group"]<-"PanNET"
+PD_UMCU_selection_prepped[PD_UMCU_selection_prepped[,"Sample_Group"]=="CaseIleum","Sample_Group"]<-"IlealNET"
+PD_UMCU_selection_prepped[PD_UMCU_selection_prepped[,"Sample_Group"]=="CaseLung","Sample_Group"]<-"PulmNET"
+PD_UMCU_selection_prepped$Sample_Group<-as.factor(PD_UMCU_selection_prepped$Sample_Group)
+
+# Merge with annotations
+UMCU_selection_prepped<-merge(PD_UMCU_selection_prepped[,c("Sample_Name","Sample_Group")], t(UMCU_selection_prepped), by.x="Sample_Name", by.y= "row.names")
+row.names(UMCU_selection_prepped)<-UMCU_selection_prepped[,1]
+UMCU_selection_prepped[,1]<-NULL
+
+Origin<-subset(UMCU_selection_prepped, select = c(Sample_Group))
+Betas<-as.data.frame(apply(subset(UMCU_selection_prepped, select = -c(Sample_Group)), 2, as.numeric))
+rownames(Betas)<-rownames(UMCU_selection_prepped)
+
+```
+
+
+# Random probe imputation and testing performance of the predictive models
+```{r random imput, message=FALSE, warning=FALSE}
+## set seed
+Seed <- 13
+set.seed(Seed)
+
+## stuff to adjust
+#percentage of random probes to test
+Perc<-seq(5, 95, by=5)/100
+SamplingRepeats <- 30
+TestSet<-t(Betas)
+Groups<-Origin
+Cols<-ncol(TestSet)
+rf_train<-finalRF$RFmodel
+lr_train<-finalLR$Ridgemodel
+Repeatlist<-list()
+Perclist<-list()
+
+# Loop to test different percentages of random probe imputation
+for(p in seq_along(Perc)){
+  RFaccuracy<-list()
+  
+  # Loop for repeated random probe imputation at certain percentage
+  for(r in 1:SamplingRepeats){
+    # Randomly replace % probes with NA
+    TestSet_temp<-apply(TestSet,2, function(column){
+    indices <- sample(length(column), as.integer(round(Perc[p]*length(column), digits = 0)))
+    column[indices]<-NA
+    #count the rumber of NAs and replace with value of randomly selected other probe of same sample, which follows a beta distribution
+    na_pos <- is.na(column)
+    na_num <- sum(na_pos)
+    column[na_pos] <- sample(x = column[!na_pos], size = na_num, replace = TRUE)
+    return(column)
+  })
+    
+  
+  # Transpose data (probes in columns) for predicting
+  tTestSet_temp<-t(TestSet_temp)
+  
+  # RF raw score output
+  RF_response<-predict(rf_train, tTestSet_temp, type = 'response')
+  RF_prob<-predict(rf_train, tTestSet_temp, type = 'prob')
+  
+  rf_acc_calc<-data.frame(as.character(Groups$Sample_Group),as.character(RF_response),stringsAsFactors=FALSE)
+  RF_Accuracy=sum(rf_acc_calc[,1]==rf_acc_calc[,2], na.rm = TRUE)/nrow(rf_acc_calc) 
+
+  RF_mROC<-multiclass.roc(Groups$Sample_Group, RF_prob, percent = TRUE, plot = FALSE)
+  RF_Logloss<-mlogLoss(Groups$Sample_Group,RF_prob)
+    
+  LR_response<-predict(lr_train, newx =  RF_prob, s = lr_train[["lambda"]], type = "class")
+  LR_prob<-predict(lr_train, newx =  RF_prob, s = lr_train[["lambda"]], type = "response")
+  
+  lr_acc_calc<-data.frame(as.character(Groups$Sample_Group),as.character(LR_response),stringsAsFactors=FALSE)
+  LR_Accuracy=sum(lr_acc_calc[,1]==lr_acc_calc[,2], na.rm = TRUE)/nrow(lr_acc_calc) 
+
+  
+    # prepare data for ROC prediction
+    LRProb_for_ROC<-as.data.frame(LR_prob)
+    colnames(LRProb_for_ROC)<- c("IlealNET", "PanNET", "PulmNET")
+  LR_mROC<-multiclass.roc(Groups$Sample_Group, LRProb_for_ROC, percent = TRUE, plot = FALSE)
+  LR_Logloss<-mlogLoss(Groups$Sample_Group,LRProb_for_ROC)
+   
+  # put data in list
+  Repeatlist[[r]] <- list()
+  Repeatlist[[r]][["RF_Accuracy"]] <- RF_Accuracy
+  Repeatlist[[r]][["RF_response"]] <- RF_response
+  Repeatlist[[r]][["RF_prob"]] <- RF_prob
+  Repeatlist[[r]][["RF_mROC"]] <- RF_mROC
+  Repeatlist[[r]][["RF_Logloss"]] <- RF_Logloss
+  Repeatlist[[r]][["LR_Accuracy"]] <- LR_Accuracy
+  Repeatlist[[r]][["LR_response"]] <- LR_response
+  Repeatlist[[r]][["LR_prob"]] <- LR_prob
+  Repeatlist[[r]][["LR_mROC"]] <- LR_mROC
+  Repeatlist[[r]][["LR_Logloss"]] <- LR_Logloss
+  }
+Perclist[[paste(Perc[p]*100, "% imputation")]]<-Repeatlist
+}
+
+newdir<-"04_randomprobe"
+ifelse(!dir.exists(file.path(getwd(), newdir)), dir.create(file.path(getwd(), newdir)), FALSE)
+
+myfile <- file.path(paste0("./04_randomprobe/Perclist","seed",Seed,"rep",SamplingRepeats,".rData"))
+save(Perclist, file = myfile)
+  
+```
+
+# Collecting and combining results from list
+```{r collecting, message=FALSE, warning=FALSE}
+results <- matrix(nrow=length(Perc), ncol=(32))
+results[,1]<-Perc*100
+results[,2]<-paste(SamplingRepeats, "repeats", Seed, "Seed")
+for (p in seq_along(Perc)){
+  RF_accuracy<-sapply(Perclist[[p]], `[[`, 1)
+  results[p,3]<- mean(RF_accuracy)
+  results[p,4]<- median(RF_accuracy)
+  results[p,5]<- sd(RF_accuracy)
+  results[p,6]<- min(RF_accuracy)
+  results[p,7]<- max(RF_accuracy)
+  RF_auc<-sapply(lapply(Perclist[[p]], `[[`, 4), `[[`, 6)
+  results[p,8]<- mean(RF_auc)/100
+  results[p,9]<- median(RF_auc)/100
+  results[p,10]<- sd(RF_auc)/100
+  results[p,11]<- min(RF_auc)/100
+  results[p,12]<- max(RF_auc)/100
+  RF_LogLoss<-sapply(Perclist[[p]], `[[`, 5)
+  results[p,13]<- mean(RF_LogLoss)
+  results[p,14]<- median(RF_LogLoss)
+  results[p,15]<- sd(RF_LogLoss)
+  results[p,16]<- min(RF_LogLoss)
+  results[p,17]<- max(RF_LogLoss)
+  
+  LR_accuracy<-sapply(Perclist[[p]], `[[`, 6)
+  results[p,18]<- mean(LR_accuracy)
+  results[p,19]<- median(LR_accuracy)
+  results[p,20]<- sd(LR_accuracy)
+  results[p,21]<- min(LR_accuracy)
+  results[p,22]<- max(LR_accuracy)
+  LR_auc<-sapply(lapply(Perclist[[p]], `[[`, 9), `[[`, 6)
+  results[p,23]<- mean(LR_auc)/100
+  results[p,24]<- median(LR_auc)/100
+  results[p,25]<- sd(LR_auc)/100
+  results[p,26]<- min(LR_auc)/100
+  results[p,27]<- max(LR_auc)/100
+  LR_LogLoss<-sapply(Perclist[[p]], `[[`, 10)
+  results[p,28]<- mean(LR_LogLoss)
+  results[p,29]<- median(LR_LogLoss)
+  results[p,30]<- sd(LR_LogLoss)
+  results[p,31]<- min(LR_LogLoss)
+  results[p,32]<- max(LR_LogLoss)
+}
+
+results<-as.data.frame(results, stringsAsFactors = FALSE)
+names(results)<-c("Percentage", "SamplingRepeatsSeed", "RF_Mean_Accuracy","RF_Median_Accuracy", "RF_SD_Accuracy", "RF_Min_Accuracy", "RF_Max_Accuracy", "RF_Mean_AUC","RF_Median_AUC", "RF_SD_AUC", "RF_Min_AUC", "RF_Max_AUC","RF_Mean_LogLoss","RF_Median_LogLoss", "RF_SD_LogLoss", "RF_Min_LogLoss", "RF_Max_LogLoss", "LR_Mean_Accuracy","LR_Median_Accuracy", "LR_SD_Accuracy", "LR_Min_Accuracy", "LR_Max_Accuracy", "LR_Mean_AUC","LR_Median_AUC", "LR_SD_AUC", "LR_Min_AUC", "LR_Max_AUC","LR_Mean_LogLoss","LR_Median_LogLoss", "LR_SD_LogLoss", "LR_Min_LogLoss", "LR_Max_LogLoss")
+
+results[,c(1,3:32)]<-apply(results[,c(1,3:32)], 2, as.numeric)
+
+```
+
+# Plot results
+```{r plot, message=FALSE, warning=FALSE}
+Legend<-"right" #“left”,“top”, “right”, “bottom”, "none"
+
+# plot results
+ggplot(results, aes(x=Percentage)) + 
+  geom_line(aes(y = RF_Mean_Accuracy, color = "RF Mean Accuracy"), size=2, group = 1) +
+  geom_errorbar(aes(ymin=RF_Mean_Accuracy-RF_SD_Accuracy, ymax=RF_Mean_Accuracy+RF_SD_Accuracy, color = "RF Mean Accuracy"), width=0.05, show.legend = FALSE)+
+  
+  geom_line(aes(y = LR_Mean_Accuracy, color = "RF+LR Mean Accuracy"), size=2, group = 1) +
+  geom_errorbar(aes(ymin=LR_Mean_Accuracy-LR_SD_Accuracy, ymax=LR_Mean_Accuracy+LR_SD_Accuracy, color = "RF+LR Mean Accuracy"), width=0.05, show.legend = FALSE)+
+  
+  geom_line(aes(y = RF_Mean_AUC, color = "RF Mean AUC"), size=2, group = 1) +
+  geom_errorbar(aes(ymin=RF_Mean_AUC-RF_SD_AUC, ymax=RF_Mean_AUC+RF_SD_AUC, color = "RF Mean AUC"), width=0.05, show.legend = FALSE)+
+  
+  geom_line(aes(y = LR_Mean_AUC, color = "RF+LR Mean AUC"), size=2, group = 1) +
+  geom_errorbar(aes(ymin=LR_Mean_AUC-LR_SD_AUC, ymax=LR_Mean_AUC+LR_SD_AUC, color = "RF+LR Mean AUC"), width=0.05, show.legend = FALSE)+
+  
+  geom_line(aes(y = RF_Mean_LogLoss, color = "RF Mean LogLoss"), size=2, group = 1) +
+  geom_errorbar(aes(ymin=RF_Mean_LogLoss-RF_SD_LogLoss, ymax=RF_Mean_LogLoss+RF_SD_LogLoss, color = "RF Mean LogLoss"), width=0.05, show.legend = F)+
+  
+  geom_line(aes(y = LR_Mean_LogLoss, color = "RF+LR Mean LogLoss"), size=2, group = 1) +
+   geom_errorbar(aes(ymin=LR_Mean_LogLoss-LR_SD_LogLoss, ymax=LR_Mean_LogLoss+LR_SD_LogLoss, color = "RF+LR Mean LogLoss"), width=0.05, show.legend = F)+
+  theme(
+    panel.border = element_blank(),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    legend.position = Legend,
+    text=element_text(size=16,family="Arial"))+
+  labs(x="Percentage randomly replaced probes", y="Model Output", colour="")
+
+ggsave("randomprobes_leg.eps", path = "./04_randomprobe/", width = 7.5,
+  height = 4,
+  units = "in")
+
+Legend<-"none" #“left”,“top”, “right”, “bottom”, "none"
+
+# plot results
+ggplot(results, aes(x=Percentage)) + 
+  geom_line(aes(y = RF_Mean_Accuracy, color = "RF Mean Accuracy"), size=2, group = 1) +
+  geom_errorbar(aes(ymin=RF_Mean_Accuracy-RF_SD_Accuracy, ymax=RF_Mean_Accuracy+RF_SD_Accuracy, color = "RF Mean Accuracy"), width=0.05, show.legend = FALSE)+
+  
+  geom_line(aes(y = LR_Mean_Accuracy, color = "RF+LR Mean Accuracy"), size=2, group = 1) +
+  geom_errorbar(aes(ymin=LR_Mean_Accuracy-LR_SD_Accuracy, ymax=LR_Mean_Accuracy+LR_SD_Accuracy, color = "RF+LR Mean Accuracy"), width=0.05, show.legend = FALSE)+
+  
+  geom_line(aes(y = RF_Mean_AUC, color = "RF Mean AUC"), size=2, group = 1) +
+  geom_errorbar(aes(ymin=RF_Mean_AUC-RF_SD_AUC, ymax=RF_Mean_AUC+RF_SD_AUC, color = "RF Mean AUC"), width=0.05, show.legend = FALSE)+
+  
+  geom_line(aes(y = LR_Mean_AUC, color = "RF+LR Mean AUC"), size=2, group = 1) +
+  geom_errorbar(aes(ymin=LR_Mean_AUC-LR_SD_AUC, ymax=LR_Mean_AUC+LR_SD_AUC, color = "RF+LR Mean AUC"), width=0.05, show.legend = FALSE)+
+  
+  geom_line(aes(y = RF_Mean_LogLoss, color = "RF Mean LogLoss"), size=2, group = 1) +
+  geom_errorbar(aes(ymin=RF_Mean_LogLoss-RF_SD_LogLoss, ymax=RF_Mean_LogLoss+RF_SD_LogLoss, color = "RF Mean LogLoss"), width=0.05, show.legend = F)+
+  
+  geom_line(aes(y = LR_Mean_LogLoss, color = "RF+LR Mean LogLoss"), size=2, group = 1) +
+   geom_errorbar(aes(ymin=LR_Mean_LogLoss-LR_SD_LogLoss, ymax=LR_Mean_LogLoss+LR_SD_LogLoss, color = "RF+LR Mean LogLoss"), width=0.05, show.legend = F)+
+  theme(
+    panel.border = element_blank(),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    legend.position = Legend,
+    text=element_text(size=16,family="Arial"))+
+  labs(x="Percentage randomly replaced probes", y="Model Output", colour="")
+
+ggsave("randomprobes_noleg.eps", path = "./04_randomprobe/", width = 7.5,
+  height = 4,
+  units = "in")
+
+```
+

@@ -1,0 +1,121 @@
+---
+title: "01-loading_and_normalizingPan_ilealNET"
+author: "Wenzel Hackeng"
+date: "22/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## **Pre-processing**
+First call the required packages
+```{r message=FALSE, warning=FALSE}
+library("GEOquery")
+library("ChAMP")
+```
+# GEO load data of gastric, duodenal, pancreatic and small intestinal sporadic and MEN1 associated Neuroendocrine Tumors (Carcinoids)
+Now load the first data (Tirosh et al. 2020)
+```{r eval=FALSE}
+dir.create("RAW")
+
+getGEOSuppFiles("GSE134089", makeDirectory = TRUE, baseDir =  './RAW')
+untar('./RAW/GSE134089/GSE134089_RAW.tar', exdir = './RAW/GSE134089/IdatFiles')
+```
+Now manually untar idat files and remove others. Put PD file in IdatFiles folder
+
+# ChAMP load data 
+During filtering, manually check proportion of failed probes to see if there are bad samples.
+
+```{r message=FALSE, warning=FALSE}
+dir.create("01_preprocessing")
+filesGSE134089<-'./RAW/GSE134089/IdatFiles/'
+set.seed(11)
+myloadGSE134089 <- champ.load(directory = filesGSE134089,
+                              method="ChAMP",
+                              methValue="B",
+                              autoimpute=FALSE, # not default
+                              filterDetP=TRUE,
+                              ProbeCutoff=0,
+                              SampleCutoff=0.1,
+                              detPcut=0.01,
+                              filterBeads=TRUE,
+                              beadCutoff=0.05,
+                              filterNoCG=TRUE,
+                              filterSNPs=TRUE,
+                              population=NULL,
+                              filterMultiHit=TRUE,
+                              filterXY=TRUE,
+                              force=FALSE,
+                              arraytype="EPIC")
+```
+
+# Free up RAM
+```{r Free space, message=FALSE, warning=FALSE}
+dir.create("./01_preprocessing/PreProcessedDataSets")
+dir.create("./01_preprocessing/PreProcessedDataSets/GSE134089")
+save(myloadGSE134089, file = './01_preprocessing/PreProcessedDataSets/GSE134089/myloadGSE134089.rData')
+
+#Free RAM
+rm(list=ls())
+gc() 
+
+#reload
+library("ChAMP")
+library("readr")
+load('./01_preprocessing/PreProcessedDataSets/GSE134089/myloadGSE134089.rData')
+
+```
+
+# ChAMP Quality Control 
+Check density plots for sample quality. 
+```{r message=FALSE, warning=FALSE}
+# 1. Quality Control files
+dir.create("./01_preprocessing/CHAMP_QCimages")
+champ.QC(beta = myloadGSE134089$beta,
+         pheno=myloadGSE134089$pd$Sample_Group,
+         mdsPlot=TRUE,
+         densityPlot=TRUE,
+         dendrogram=TRUE,
+         PDFplot=TRUE,
+         Rplot=TRUE,
+         Feature.sel="None",
+         resultsDir = "./01_preprocessing/CHAMP_QCimages/GSE134089/")
+```
+
+# ChAMP Normalisation
+Normalisation, BMIQ is recommended 
+```{r message=FALSE, warning=FALSE}
+dir.create("./01_preprocessing/Normalisation")
+mynormGSE134089<-champ.norm(beta=myloadGSE134089$beta, rgSet=myloadGSE134089$rgSet, mset=myloadGSE134089$mset, 
+                    resultsDir = "./01_preprocessing/Normalisation/GSE134089/", 
+                    method="BMIQ", 
+                    plotBMIQ=TRUE, 
+                    arraytype="EPIC",
+                    cores=4)
+```
+
+```{r}
+PD_GSE134089 <- read_csv("./PD_FILES/PD_GSE134089.csv", 
+    skip = 7)
+PD_GSE134089<-PD_GSE134089[!(PD_GSE134089$Sample_Name=="B08_tumor"),] # low quality sample removed in preprocessing
+PD_GSE134089<-PD_GSE134089[!(PD_GSE134089$Sample_Name=="F08_tumor"),] # low quality sample removed in preprocessing
+
+
+PD_GSE134089cases<-subset(PD_GSE134089, Sample_Group == "IlealNET" | Sample_Group == "PanNET"| Sample_Group == "UPNET")
+PD_GSE134089otherGI<-subset(PD_GSE134089, Sample_Group == "DuoNET" | Sample_Group == "GasNET")
+
+
+mynormGSE134089cases <- as.data.frame(mynormGSE134089[,colnames(mynormGSE134089) %in% PD_GSE134089cases$Sample_Name])
+mynormGSE134089otherGI <- as.data.frame(mynormGSE134089[,colnames(mynormGSE134089) %in% PD_GSE134089otherGI$Sample_Name])
+
+```
+
+
+# Save normalized data for later use
+```{r message=FALSE, warning=FALSE}
+save(mynormGSE134089cases, mynormGSE134089otherGI, PD_GSE134089cases, PD_GSE134089otherGI, file = './01_preprocessing/PreProcessedDataSets/GSE134089/preprocessedGSE134089.rData')
+
+```
+

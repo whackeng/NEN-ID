@@ -1,0 +1,275 @@
+---
+title: "02-merge_and_peek"
+author: "Wenzel Hackeng"
+date: "22/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## **2-d visualisation**
+First call the required packages and functions
+```{r message=FALSE, warning=FALSE}
+library('Rtsne')
+library('ChAMP')
+library('ggplot2')
+library('ggrepel')
+library('ggsci')
+library('caret')
+library('matrixStats')
+library('pheatmap')
+library('cowplot')
+```
+
+# Load preprocessed data
+```{r message=FALSE, warning=FALSE}
+load('./01_preprocessing/PreProcessedDataSets/UMCU/preprocessedUMCU.rData')
+load('./01_preprocessing/PreProcessedDataSets/GSE117852/preprocessedGSE117852.rData')
+load('./01_preprocessing/PreProcessedDataSets/GSE118133/preprocessedGSE118133.rData')
+load('./01_preprocessing/PreProcessedDataSets/IlealGSE73832/preprocessedIlealGSE73832.rData')
+PD_combined<-read.csv("./PD_FILES/PD_combined.csv", header=TRUE)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+Seed<-11
+Cluster<-"euclidean" #"correlation","euclidean"
+newdir<-"02_merge_and_peek"
+ifelse(!dir.exists(file.path(getwd(), newdir)), dir.create(file.path(getwd(), newdir)), FALSE)
+```
+
+# Data merge and save for further processing
+Overlapping probes are selected by merging data. 
+```{r message=FALSE, warning=FALSE}
+df1<- as.data.frame(mynormGSE117852)
+df2<- as.data.frame(mynormGSE118133)
+df3<- as.data.frame(mynormilealGSE73832)
+df4<- as.data.frame(mynormUMCU)
+
+premerge<- merge(df3, df1, by.x="row.names", by.y="row.names")
+merged<- merge(premerge, df2, by.x="Row.names", by.y="row.names")
+rownames(merged) <- merged[,1]
+merged[,1] <- NULL
+
+
+dir.create("./01_preprocessing/PreProcessedDataSets/GEOMERGED")
+save(merged, file = './01_preprocessing/PreProcessedDataSets/GEOMERGED/GEOMERGED.rData')
+```
+
+# Select most variable positions (MVP)
+Triple downsampling cases until groups are equal. 5000 probes with the highest mean absolute standard deviation
+```{r message=FALSE, warning=FALSE}
+# add class information
+tmerged<-as.data.frame(t(merged))
+annoGEO<- merge(PD_combined[,c(1,3)], tmerged, by.x="Sample_Name", by.y="row.names", sort = FALSE)
+annoGEO$Sample_Group <- factor(annoGEO$Sample_Group, levels = unique(annoGEO$Sample_Group))
+
+# downsample three times
+set.seed(Seed)
+downsampnames<-list()
+for(i in 1:3){
+  downsampnames[[i]]<-downSample(annoGEO[,1],annoGEO$Sample_Group)
+}
+# merge with beta values and determine mean absolute standard deviation
+downsamples<-lapply(downsampnames,function(x,y){merge(x, y, by.x=names(x)[1], by.y="row.names")},tmerged)
+downsamples<-lapply(downsamples, "[", -c(1, 2))
+downsamples<-lapply(downsamples,function(x){t(x)})
+
+a<-downsamples[[1]]
+b<-downsamples[[2]]
+c<-downsamples[[3]]
+
+amads=apply(a,1,mad)
+bmads=apply(b,1,mad)
+cmads=apply(c,1,mad)
+
+amergedmad<-as.data.frame(a[rev(order(amads)),])
+bmergedmad<-as.data.frame(b[rev(order(bmads)),])
+cmergedmad<-as.data.frame(c[rev(order(cmads)),])
+
+amergedmad$ordera<-1:nrow(amergedmad)
+bmergedmad$orderb<-1:nrow(bmergedmad)
+cmergedmad$orderc<-1:nrow(cmergedmad)
+
+# selecting probes by the minimal rank of the mean absolute standard deviation over all downsamples. 
+
+MVprobes<-merge(amergedmad, bmergedmad, by.x= "row.names", by.y= "row.names")
+MVprobes<-merge(MVprobes, cmergedmad, by.x= "Row.names", by.y= "row.names")
+rownames(MVprobes) <- MVprobes[,1]
+MVprobes[,1] <-NULL
+MVprobes<-MVprobes[,c("ordera","orderb","orderc")]
+
+MVprobes$min <- rowMins(as.matrix(MVprobes))
+MVprobes$max <- rowMaxs(as.matrix(MVprobes))
+
+MVprobes <-MVprobes[order(MVprobes$max, decreasing = FALSE),]
+bestprobesMVP<-MVprobes[1:5000,c("min", "max")]
+
+# merge with beta valus for further analysis
+mergedmad<-merge(bestprobesMVP, merged, by.x= "row.names", by.y= "row.names")
+rownames(mergedmad) <- mergedmad[,1]
+mergedmad[,1:3] <-NULL
+
+```
+
+# T-sne visualization on complete training cohort
+without PCA. Of note, Lung carcinoid type 2 carcinoids show aberrant clustering in T-sne and unsupervised hierarchical clusterig
+```{r message=FALSE, warning=FALSE, fig.width=9, fig.height=4.5}
+
+tmergedmad<-as.data.frame(t(mergedmad))
+annodatamerged<- merge(tmergedmad, PD_combined, by.x="row.names", by.y="Sample_Name", sort = FALSE)
+annodatamerged$Sample_Group <- factor(annodatamerged$Sample_Group, levels = unique(annodatamerged$Sample_Group))
+annodatamerged$Sample_Group<-factor(annodatamerged$Sample_Group, levels = c("PanNET", "PulmNET","IlealNET"))
+
+## TSNE with label
+set.seed(Seed) # for reproducibility
+tsne_out <- Rtsne(tmergedmad,pca=FALSE, 
+                  dims = 2, 
+                  theta=0, 
+                  perplexity = 16, 
+                  verbose=F, 
+                  max_iter = 5000)
+
+tsne_plot <- data.frame(x = tsne_out$Y[,1], y = tsne_out$Y[,2], col = annodatamerged$Sample_Group, lab = annodatamerged$Row.names)
+ggplot(tsne_plot)+ 
+  geom_point(aes(x=x, y=y, color=col, size=30))+
+  geom_text_repel(aes(x=x, y=y, label=lab), size=3, family="Arial")+
+  labs(x = "t-SNE 1", y = "t-SNE 2", col = "Origins")+
+  scale_color_npg(labels = c("Chan et al. Pancreas NET", "Laddha et al. Lung NET", "Karpathakis et al. Ileal NET"))+
+  theme(
+    panel.border = element_blank(),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    legend.key=element_blank())+
+  guides(colour = guide_legend(override.aes = list(size=5)))
+
+ggsave("tSNEtraining.eps", path = "./02_merge_and_peek/", width = 10,
+  height = 6,
+  units = "in")
+
+```
+
+
+# Unsupervised Hierarchical Clustering complete training cohort 
+```{r message=FALSE, warning=FALSE}
+Var1        <- c("#DC0000B2", "#4DBBD5B2","purple")
+names(Var1) <- c("PanNET","PulmNET","IlealNET")
+anno_colors <- list(Var1 = Var1)
+
+pd<-as.data.frame(annodatamerged$Sample_Group[1:69])
+row.names(pd)<-annodatamerged[1:69,1]
+names(pd)[1]<-"Type"
+pd[,1]<-as.character(pd[,1])
+set.seed(Seed)
+heat<-pheatmap(mergedmad[1:5000,1:69], kmeans_k = NA, breaks = NA, border_color= "grey60",cellwidth = 5, cellheight = 0.05, scale = "none", cluster_rows = TRUE,
+         cluster_cols = TRUE, clustering_distance_rows = Cluster,
+         clustering_distance_cols = Cluster, clustering_method = "complete",
+         cutree_rows = 1, cutree_cols = 1,
+         legend_labels = NA, annotation_row = NA, annotation.col = pd,
+         annotation = pd, annotation_colors = anno_colors, annotation_legend = TRUE,
+         annotation_names_row = TRUE, annotation_names_col = TRUE,
+         drop_levels = TRUE, show_rownames = F, show_colnames = T, main = NA, fontsize = 4,
+         fontsize_row = 4, fontsize_col = 4,
+         display_numbers = F, number_format = "%.2f", number_color = "grey30",
+         fontsize_number = 0.8 * fontsize, gaps_row = NULL, gaps_col = NULL,
+         labels_row = NULL, labels_col = NULL, filename = NA, width = NA,
+         height = NA, silent = FALSE)
+
+save_pheatmap_pdf <- function(x, filename, width=7, height=7) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   pdf(filename, width=width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+}
+save_pheatmap_pdf(heat, "./02_merge_and_peek/SupFigclustering.pdf")
+
+```
+
+# Merge with UMCU cases and add origin information
+Load combined PD files. Merge UMCU cases with the MVPs as selected in the merged online cohorts. Combine origin information of cases  with the most variable positions
+```{r message=FALSE, warning=FALSE}
+mergedmadumcu<-merge(mergedmad, df4, by.x="row.names", by.y="row.names")
+rownames(mergedmadumcu) <- mergedmadumcu[,1]
+mergedmadumcu[,1] <- NULL
+nrow(mergedmadumcu)
+
+tmergedmadumcu<-as.data.frame(t(mergedmadumcu))
+annodatamergedumcu<- merge(tmergedmadumcu, PD_combined, by.x="row.names", by.y="Sample_Name", sort = FALSE)
+annodatamergedumcu$Sample_Group <- factor(annodatamergedumcu$Sample_Group, levels = unique(annodatamergedumcu$Sample_Group))
+
+annodatamergedumcu$Sample_Group<-factor(annodatamergedumcu$Sample_Group, levels = c( "PanNET","PulmNET", "IlealNET", "CasePan", "CaseLung", "CaseUP", "CaseIleum"))
+
+```
+
+# T-sne visualization on complete training cohort and UMCU test cohort
+without PCA without annotations
+```{r message=FALSE, warning=FALSE, fig.width=9, fig.height=4.5}
+## TSNE with label
+set.seed(Seed) # for reproducibility
+tsne_out <- Rtsne(tmergedmadumcu,pca=FALSE, 
+                  dims = 2, 
+                  theta=0, 
+                  perplexity = 16, 
+                  verbose=F, 
+                  max_iter = 5000)
+
+tsne_plot <- data.frame(x = tsne_out$Y[,1], y = tsne_out$Y[,2], col = annodatamergedumcu$Sample_Group, lab = annodatamergedumcu$Row.names)
+ggplot(tsne_plot)+ 
+  geom_point(aes(x=x, y=y, color=col, size=30))+
+  #geom_text_repel(aes(x=x, y=y, label=lab), size=3, family="Arial")+
+  labs(x = "t-SNE 1", y = "t-SNE 2", col = "Origins")+
+  scale_color_npg(labels = c("Chan et al. Pancreas NET", "Laddha et al. Lung NET","Karpathakis et al. Ileal NET", "UMCU Pancreas NET", "UMCU Lung NET", "UMCU Unknown Primary", "UMCU Ileal NET"))+
+  theme(
+    panel.border = element_blank(),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    legend.key=element_blank())+
+  guides(colour = guide_legend(override.aes = list(size=5)))
+
+ggsave("tSNEfig1.eps", path = "./02_merge_and_peek/", width = 7.5,
+  height = 4,
+  units = "in")
+
+```
+
+
+# T-sne visualization on complete training cohort and UMCU test cohort
+without PCA with annotations
+```{r message=FALSE, warning=FALSE, fig.width=9, fig.height=4.5}
+## TSNE with label
+set.seed(Seed) # for reproducibility
+tsne_out <- Rtsne(tmergedmadumcu,pca=FALSE, 
+                  dims = 2, 
+                  theta=0, 
+                  perplexity = 16, 
+                  verbose=F, 
+                  max_iter = 5000)
+
+tsne_plot <- data.frame(x = tsne_out$Y[,1], y = tsne_out$Y[,2], col = annodatamergedumcu$Sample_Group, lab = annodatamergedumcu$Row.names)
+ggplot(tsne_plot)+ 
+  geom_point(aes(x=x, y=y, color=col, size=30))+
+  geom_text_repel(aes(x=x, y=y, label=lab), size=3, family="Arial")+
+  labs(x = "t-SNE 1", y = "t-SNE 2", col = "Origins")+
+  scale_color_npg(labels = c("Chan et al. Pancreas NET", "Laddha et al. Lung NET","Karpathakis et al. Ileal NET", "UMCU Pancreas NET", "UMCU Lung NET", "UMCU Unknown Primary", "UMCU Ileal NET"))+
+  theme(
+    panel.border = element_blank(),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    legend.key=element_blank())+
+  guides(colour = guide_legend(override.aes = list(size=5)))
+
+ggsave("tSNEfig1_anno.eps", path = "./02_merge_and_peek/", width = 10,
+  height = 6,
+  units = "in")
+
+```

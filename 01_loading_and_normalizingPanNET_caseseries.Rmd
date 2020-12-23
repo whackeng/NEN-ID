@@ -1,0 +1,101 @@
+---
+title: "01-loading-and-normalizing-PanNET-caseseries"
+author: "Wenzel Hackeng"
+date: "22/10/2020"
+output: html_document
+---
+
+## **Pre-processing**
+First call the required packages
+```{r message=FALSE, warning=FALSE}
+library("GEOquery")
+library("ChAMP")
+library("readxl")
+library("readr")
+library("plyr")
+```
+
+# GEO load PanNETs Timp et al 2014
+```{r eval=FALSE}
+dir.create("RAW")
+gset <- getGEO("GSE53051", GSEMatrix =TRUE, getGPL=FALSE)
+if (length(gset) > 1) idx <- grep("GSE53051", attr(gset, "names")) else idx <- 1
+gset <- gset[[idx]]
+GSE53051_phenodata<- as.data.frame(pData(gset))
+
+dir.create("./RAW/GSE53051")
+dir.create("./RAW/GSE53051/GSMFiles")
+
+NETGSMs<-c("GSM1281286","GSM1281287","GSM1281290","GSM1281291","GSM1281294")
+
+for(i in NETGSMs){
+getGEOfile(i, destdir = './RAW/GSE53051/GSMFiles', AnnotGPL = FALSE, amount = c("data"))
+}
+
+PD_GSE53051<-GSE53051_phenodata[NETGSMs,]
+save(PD_GSE53051, file = './PD_FILES/PD_GSE53051.rData')
+```
+
+# Data wrangling
+Of note, these data are not filtered yet. 
+```{r message=FALSE, warning=FALSE}
+NETGSMs<-c("GSM1281286","GSM1281287","GSM1281290","GSM1281291","GSM1281294")
+Pheno<-c("PanNET","PanNET","PanNET","PanNET","PanNET")
+
+
+GSMdata <-list()
+for (i in NETGSMs){
+temp <- as.data.frame(read_table2(paste0("./RAW/GSE53051/GSMFiles/", i, ".soft", sep = ""), skip = 4))
+temp$Pval<-NULL
+GSMdata[[i]]<-temp
+}
+
+GSE53051pancreasbetas<-join_all(GSMdata[NETGSMs], by = "ID_REF", type = "inner", match = "all")
+GSE53051pancreasbetas<-GSE53051pancreasbetas[complete.cases(GSE53051pancreasbetas), ]
+row.names(GSE53051pancreasbetas)<-GSE53051pancreasbetas[,1]
+GSE53051pancreasbetas[,1]<-NULL
+colnames(GSE53051pancreasbetas)<-NETGSMs
+
+```
+
+# ChAMP Quality Control 
+Check density plots for sample quality. 
+```{r message=FALSE, warning=FALSE}
+
+dir.create("./01_preprocessing/CHAMP_QCimages")
+champ.QC(beta = as.matrix(GSE53051pancreasbetas),
+         pheno=Pheno,
+         mdsPlot=TRUE,
+         densityPlot=TRUE,
+         dendrogram=TRUE,
+         PDFplot=TRUE,
+         Rplot=TRUE,
+         Feature.sel="None",
+         resultsDir = "./01_preprocessing/CHAMP_QCimages/GSE53051/")
+
+```
+
+# ChAMP Normalisation
+Normalisation, BMIQ is used voor data as Karphathakis' data was BMIQ normalized (BMIQ best method)
+
+```{r message=FALSE, warning=FALSE}
+dir.create("./01_preprocessing/Normalisation")
+set.seed(11)
+mynormGSE53051<-champ.norm(beta=as.matrix(GSE53051pancreasbetas),
+                    resultsDir = "./01_preprocessing/Normalisation/GSE53051/", 
+                    method="BMIQ", 
+                    plotBMIQ=TRUE, 
+                    arraytype="450k",
+                    cores=4)
+```
+
+
+# Save normalized data for later use
+```{r message=FALSE, warning=FALSE}
+dir.create("./01_preprocessing/PreProcessedDataSets")
+dir.create("./01_preprocessing/PreProcessedDataSets/GSE53051")
+
+save(GSE53051pancreasbetas, mynormGSE53051, file = './01_preprocessing/PreProcessedDataSets/GSE53051/preprocessedPancreasCasesGSE53051.rData')
+
+```
+
